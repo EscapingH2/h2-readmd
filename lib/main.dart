@@ -428,9 +428,10 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
         color: Theme.of(context).colorScheme.surface,
         child: TextField(
           controller: _controller,
-          scrollController: Platform.isWindows ? _editorScrollController : null,
           maxLines: null,
-          expands: true,
+          // Windows uses the panel's outer viewport; the field grows with text.
+          expands: !Platform.isWindows,
+          scrollPhysics: Platform.isWindows ? const NeverScrollableScrollPhysics() : null,
           textAlignVertical: TextAlignVertical.top,
           keyboardType: TextInputType.multiline,
           style: Platform.isWindows
@@ -458,7 +459,21 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
       scrollbarOrientation: ScrollbarOrientation.right,
       child: ScrollConfiguration(
         behavior: const _EditorScrollBehavior(),
-        child: editor,
+        child: LayoutBuilder(builder: (context, constraints) {
+          return SingleChildScrollView(
+            controller: _editorScrollController,
+            primary: false,
+            // This padding participates in maxScrollExtent and scrolls away.
+            // It does not inset the viewport or move the scrollbar inward.
+            padding: const EdgeInsets.only(bottom: 20),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                minHeight: (constraints.maxHeight - 20).clamp(0.0, double.infinity).toDouble(),
+              ),
+              child: editor,
+            ),
+          );
+        }),
       ),
     );
   }

@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -51,13 +52,13 @@ void main() {
   testWidgets('New document previews edits and clears dirty state on restore',
       (tester) async {
     await startApp(tester, const MarkdownApp());
-    expect(find.text('Untitled.md'), findsOneWidget);
+    expect(find.text('Untitled.md'), Platform.isWindows ? findsNothing : findsOneWidget);
     expect(
         tester.widget<TextField>(find.byType(TextField)).controller!.text, '');
 
     await tester.enterText(find.byType(TextField), '中文预览测试');
     await tester.pumpAndSettle();
-    expect(find.text('*Untitled.md'), findsOneWidget);
+    expect(find.text('*Untitled.md'), Platform.isWindows ? findsNothing : findsOneWidget);
     expect(previewText('中文预览测试'), findsWidgets);
     if (Platform.isWindows) {
       expect(nativeTitles.last, '*Untitled.md - H2 Readmd');
@@ -65,7 +66,7 @@ void main() {
 
     await tester.enterText(find.byType(TextField), '');
     await tester.pumpAndSettle();
-    expect(find.text('Untitled.md'), findsOneWidget);
+    expect(find.text('Untitled.md'), Platform.isWindows ? findsNothing : findsOneWidget);
     expect(find.text('*Untitled.md'), findsNothing);
     expect(previewText('中文预览测试'), findsNothing);
     if (Platform.isWindows) {
@@ -74,6 +75,63 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
+
+  testWidgets('Windows toolbar keeps file actions visible at every width',
+      (tester) async {
+    await startApp(tester, const MarkdownApp());
+    for (final width in [180.0, 240.0, 300.0, 400.0, 800.0, 1920.0]) {
+      await tester.binding.setSurfaceSize(Size(width, 800));
+      await tester.pumpAndSettle();
+      Rect? previous;
+      for (final tip in ['新建', '打开', '保存', '更多']) {
+        final finder = find.byTooltip(tip);
+        expect(finder, findsOneWidget);
+        final rect = tester.getRect(finder);
+        expect(rect.left, greaterThanOrEqualTo(0));
+        expect(rect.right, lessThanOrEqualTo(width));
+        if (previous != null) expect(rect.left, greaterThanOrEqualTo(previous.right));
+        previous = rect;
+      }
+      expect(find.text('Untitled.md'), findsNothing);
+      expect(tester.takeException(), isNull);
+    }
+    await tester.pumpWidget(const SizedBox.shrink());
+  }, skip: !Platform.isWindows);
+
+  for (final newDocument in [false, true]) {
+    testWidgets('Ctrl+S saves ${newDocument ? "new" : "opened"} document with editor focus',
+        (tester) async {
+      const path = r'C:\Documents\中文 文档.md';
+      final calls = <MethodCall>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(const MethodChannel('filegate'), (call) async {
+        calls.add(call);
+        return {'path': path, 'name': '中文 文档.md', 'kind': 'file'};
+      });
+      addTearDown(() => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(const MethodChannel('filegate'), null));
+      await startApp(tester, MarkdownApp(initialPath: newDocument ? null : path));
+      for (final text in ['首次保存', '再次保存']) {
+        await tester.enterText(find.byType(TextField), text);
+        await tester.pumpAndSettle();
+        expect(tester.widget<EditableText>(find.byType(EditableText)).focusNode.hasFocus, isTrue);
+        expect(nativeTitles.last, startsWith('*'));
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.keyS);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pumpAndSettle();
+        expect(calls.length, text == '首次保存' ? 1 : 2);
+        final call = calls.last;
+        expect(call.method, newDocument && calls.length == 1 ? 'save' : 'write');
+        final arguments = call.arguments as Map;
+        expect(utf8.decode(arguments['bytes'] as List<int>), text);
+        if (call.method == 'write') expect(arguments['path'], path);
+        expect(nativeTitles.last, '中文 文档.md - H2 Readmd');
+        expect(tester.takeException(), isNull);
+      }
+      await tester.pumpWidget(const SizedBox.shrink());
+    }, skip: !Platform.isWindows);
+  }
 
   testWidgets('Windows editor exposes first and last lines after resize',
       (tester) async {
@@ -127,7 +185,7 @@ void main() {
         ));
     expect(tester.widget<TextField>(find.byType(TextField)).controller!.text,
         source);
-    expect(find.text('protocol.md'), findsOneWidget);
+    expect(find.text('protocol.md'), Platform.isWindows ? findsNothing : findsOneWidget);
     if (Platform.isWindows) {
       expect(nativeTitles.last, 'protocol.md - H2 Readmd');
     }
@@ -136,14 +194,14 @@ void main() {
 
     await tester.enterText(find.byType(TextField), '$source\n修改');
     await tester.pumpAndSettle();
-    expect(find.text('*protocol.md'), findsOneWidget);
+    expect(find.text('*protocol.md'), Platform.isWindows ? findsNothing : findsOneWidget);
     if (Platform.isWindows) {
       expect(nativeTitles.last, '*protocol.md - H2 Readmd');
     }
 
     await tester.enterText(find.byType(TextField), source);
     await tester.pumpAndSettle();
-    expect(find.text('protocol.md'), findsOneWidget);
+    expect(find.text('protocol.md'), Platform.isWindows ? findsNothing : findsOneWidget);
     expect(find.text('*protocol.md'), findsNothing);
     if (Platform.isWindows) {
       expect(nativeTitles.last, 'protocol.md - H2 Readmd');

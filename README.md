@@ -1,7 +1,7 @@
 # H2 Readmd
 
 轻量级、本地运行的 Markdown 阅读与编辑器，适合粘贴 ChatGPT 回答、编辑 Markdown 和阅读长文档。
-当前发布目标为 **1.0.1，正式支持 Windows x64**。Android 仅为未来计划，当前仓库没有 Android 工程或可用 APK。
+当前发布目标为 **1.0.2，正式支持 Windows x64**。Android 仅为未来计划，当前仓库没有 Android 工程或可用 APK。
 
 ## 功能
 
@@ -18,7 +18,7 @@
 
 ## Windows 安装和卸载
 
-使用发布附件中的 `H2Readmd-Setup-1.0.1-x64.exe` 安装（仓库发布地址待建立后补充）。
+使用发布附件中的 `H2Readmd-Setup-1.0.2-x64.exe` 安装（仓库发布地址待建立后补充）。
 默认安装到 `C:\Program Files\H2 Readmd`，需要管理员确认。
 安装创建开始菜单快捷方式；桌面快捷方式可选，默认不勾选；完成后可选择立即启动。
 
@@ -97,7 +97,7 @@ Widget 测试模拟窗口插件，不替代真实系统文件对话框、窗口�
 
 ## Inno Setup 打包
 
-项目版本为 `1.0.1+2`，安装程序版本为 `1.0.1`；Windows 文件版本由 Flutter 版本宏生成。
+项目版本为 `1.0.2+3`，安装程序版本为 `1.0.2`；Windows 文件版本由 Flutter 版本宏生成。
 先退出旧程序，构建 Release，并补入第三方许可文本：
 
 ```powershell
@@ -107,7 +107,7 @@ flutter build windows --release
 ```
 
 也可在 Inno Setup Compiler 打开 `installer/H2Readmd.iss` 后编译。
-输出为 `dist/H2Readmd-Setup-1.0.1-x64.exe`；脚本使用相对路径，递归打包整个 Release 目录。
+输出为 `dist/H2Readmd-Setup-1.0.2-x64.exe`；脚本使用相对路径，递归打包整个 Release 目录。
 每次重新构建后都需重新执行声明复制步骤。分发前检查版本、安装、启动、文件关联和卸载。
 安装脚本的 ProgID 与卸载规则只管理本程序注册项，不强制改变默认应用。
 

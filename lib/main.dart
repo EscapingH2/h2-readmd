@@ -657,41 +657,42 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
         decoration: BoxDecoration(border: Border(bottom: BorderSide(color: Theme.of(context).colorScheme.outlineVariant))),
         child: LayoutBuilder(builder: (context, constraints) {
           final width = constraints.maxWidth;
-          // At extreme widths, keep every action reachable without overlapping.
-          if (width < 160) {
-            return Align(alignment: Alignment.centerRight,
-              child: _toolbarMore(collapsed: true, includeSave: true, includeViews: true));
-          }
-          final full = width >= 720;
-          final tiny = width < 400;
-          final showSave = width >= 480;
-          final centerWidth = tiny ? 40.0 : (full ? 216.0 : 144.0);
-          final sideWidth = ((width - centerWidth) / 2 - 16).clamp(0.0, double.infinity).toDouble();
+          final compact = width < 420;
+          final menuViews = width < 300;
+          final actionSize = compact ? 36.0 : 40.0;
           Widget action(String tip, IconData icon, VoidCallback? callback) => SizedBox(
-            width: 40, height: 40,
-            child: IconButton(tooltip: tip, iconSize: 21, onPressed: callback, icon: Icon(icon)),
+            width: actionSize, height: 40,
+            child: IconButton(
+              tooltip: tip, iconSize: 21, padding: EdgeInsets.zero,
+              onPressed: callback, icon: Icon(icon),
+            ),
           );
-          return Stack(alignment: Alignment.center, children: [
-            Positioned(left: 12, width: sideWidth,
-              child: Tooltip(message: _documentLabel, child: Text(_documentLabel,
-                maxLines: 1, overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w500)))),
-            SizedBox(width: centerWidth, child: tiny
+          final controls = Row(children: [
+            SizedBox(width: menuViews ? 36 : (compact ? 126 : 216), child: menuViews
               ? PopupMenuButton<ViewMode>(
-                  tooltip: '视图', icon: const Icon(Icons.view_week_outlined, size: 21),
+                  tooltip: '视图', padding: EdgeInsets.zero,
+                  icon: const Icon(Icons.view_week_outlined, size: 21),
                   onSelected: (value) => setState(() => _view = value),
                   itemBuilder: (_) => ViewMode.values.map((mode) => CheckedPopupMenuItem(
                     value: mode, checked: mode == _view,
                     child: Text(['分栏', '编辑', '预览'][mode.index]))).toList(),
                 )
-              : _viewControl(compact: !full)),
-            Positioned(right: 8, child: Row(mainAxisSize: MainAxisSize.min, children: [
-              if (full) action('新建', Icons.note_add_outlined, _newFile),
-              if (full) action('打开', Icons.folder_open_outlined, _open),
-              if (showSave) action('保存', Icons.save_outlined, _busy ? null : () => _save()),
-              SizedBox(width: 40, height: 40, child: _toolbarMore(collapsed: !full, includeSave: !showSave)),
-            ])),
+              : _viewControl(compact: compact)),
+            const Spacer(),
+            action('新建', Icons.note_add_outlined, _newFile),
+            action('打开', Icons.folder_open_outlined, _open),
+            action('保存', Icons.save_outlined, _busy ? null : () => _save()),
+            SizedBox(width: actionSize, height: 40,
+              child: _toolbarMore(collapsed: false, includeSave: false)),
           ]);
+          // Keep file actions visible; only exceptionally small windows scale.
+          return Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: width < 208
+                ? FittedBox(fit: BoxFit.scaleDown,
+                    child: SizedBox(width: 192, height: 40, child: controls))
+                : controls,
+          );
         }),
       ),
     ),
@@ -726,7 +727,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   Widget build(BuildContext context) {
     final mobile = !Platform.isWindows && (MediaQuery.sizeOf(context).width < 700 || Platform.isAndroid);
     final visible = mobile && _view == ViewMode.both ? ViewMode.editor : _view;
-    return PopScope(
+    final page = PopScope(
       canPop: !_dirty,
       onPopInvokedWithResult: (didPop, result) async {
         if (didPop || _handlingExit) return;
@@ -790,6 +791,15 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
           ),
         ]),
       ),
+    );
+    if (!Platform.isWindows) return page;
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.keyS, control: true): () {
+          if (!_handlingExit && !_exitCommitted) _save();
+        },
+      },
+      child: Focus(autofocus: true, child: page),
     );
   }
 }

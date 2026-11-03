@@ -149,6 +149,9 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   static const _files = Filegate();
   final _controller = TextEditingController();
   final _editorScrollController = ScrollController();
+  final _previewScrollController = ScrollController();
+  double? _editorLayoutWidth;
+  double? _previewLayoutWidth;
   String? _path;
   String _name = 'Untitled.md';
   String _savedText = '';
@@ -221,6 +224,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     _controller.removeListener(_changed);
     _controller.dispose();
     _editorScrollController.dispose();
+    _previewScrollController.dispose();
     super.dispose();
   }
 
@@ -508,6 +512,8 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
         color: Theme.of(context).colorScheme.surface,
         child: _markdownTheme(SelectionArea(
           child: CustomScrollView(
+            controller: _previewScrollController,
+            primary: false,
             slivers: [
               SliverPadding(
                 // Match the Windows editor's zero top inset. This changes
@@ -699,27 +705,41 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   );
 
   Widget _desktopBody(BoxConstraints constraints) {
-    if (_view == ViewMode.editor) return _editor();
-    if (_view == ViewMode.preview) return _preview();
     final width = constraints.maxWidth;
-    if (width <= 10) return _editor();
-    final available = width - 10;
+    final split = _view == ViewMode.both && width > 10;
+    final available = (width - 10).clamp(0.0, double.infinity).toDouble();
     final minimum = available < 440 ? available * .2 : 220.0;
     final leftWidth = (available * _editorFraction).clamp(minimum, available - minimum).toDouble();
-    return Row(children: [
-      SizedBox(width: leftWidth, child: _editor()),
-      MouseRegion(
-        cursor: SystemMouseCursors.resizeColumn,
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onHorizontalDragUpdate: (details) => setState(() {
-            _editorFraction = ((leftWidth + details.delta.dx) / available)
-                .clamp(minimum / available, 1 - minimum / available);
-          }),
-          child: const SizedBox(width: 10, child: VerticalDivider(width: 10, thickness: 1)),
+    final showEditor = _view != ViewMode.preview;
+    final showPreview = _view != ViewMode.editor && (width > 10 || _view == ViewMode.preview);
+    if (showEditor) _editorLayoutWidth = split ? leftWidth : width;
+    if (showPreview) _previewLayoutWidth = split ? available - leftWidth : width;
+    // Stable sibling slots retain both subtrees and their ScrollPositions.
+    // Hidden panes keep their last width so hiding does not reflow their text.
+    return Stack(children: [
+      Positioned(left: 0, top: 0, bottom: 0,
+        width: _editorLayoutWidth ?? width,
+        child: Offstage(offstage: !showEditor,
+          child: ExcludeFocus(excluding: !showEditor, child: _editor()))),
+      Positioned(right: 0, top: 0, bottom: 0,
+        width: _previewLayoutWidth ?? width,
+        child: Offstage(offstage: !showPreview,
+          child: ExcludeFocus(excluding: !showPreview, child: _preview()))),
+      Positioned(left: leftWidth, top: 0, bottom: 0, width: 10,
+        child: Offstage(offstage: !split,
+          child: MouseRegion(
+            cursor: SystemMouseCursors.resizeColumn,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onHorizontalDragUpdate: (details) => setState(() {
+                _editorFraction = ((leftWidth + details.delta.dx) / available)
+                    .clamp(minimum / available, 1 - minimum / available);
+              }),
+              child: const VerticalDivider(width: 10, thickness: 1),
+            ),
+          ),
         ),
       ),
-      Expanded(child: _preview()),
     ]);
   }
 

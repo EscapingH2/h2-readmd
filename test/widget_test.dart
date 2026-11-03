@@ -133,6 +133,35 @@ void main() {
     }, skip: !Platform.isWindows);
   }
 
+  testWidgets('View switches retain both viewport states and independent offsets',
+      (tester) async {
+    await startApp(tester, MarkdownApp(
+      initialText: List.generate(200, (i) => 'Line $i').join('\n\n')));
+    final editorFinder = find.byType(SingleChildScrollView, skipOffstage: false);
+    final previewFinder = find.byType(CustomScrollView, skipOffstage: false);
+    final editorController = tester.widget<SingleChildScrollView>(editorFinder).controller!;
+    final previewController = tester.widget<CustomScrollView>(previewFinder).controller!;
+    final editorPosition = editorController.position;
+    final previewPosition = previewController.position;
+    final editableState = tester.state<EditableTextState>(
+      find.byType(EditableText, skipOffstage: false));
+    editorController.jumpTo(350);
+    previewController.jumpTo(600);
+    await tester.pumpAndSettle();
+    for (final mode in ['编辑', '分栏', '预览', '分栏', '编辑', '分栏', '预览', '编辑']) {
+      await tester.tap(find.text(mode));
+      await tester.pumpAndSettle();
+      expect(editorController.position, same(editorPosition));
+      expect(previewController.position, same(previewPosition));
+      expect(tester.state<EditableTextState>(
+        find.byType(EditableText, skipOffstage: false)), same(editableState));
+      expect(editorController.offset, closeTo(350, 1));
+      expect(previewController.offset, closeTo(600, 1));
+      expect(tester.takeException(), isNull);
+    }
+    await tester.pumpWidget(const SizedBox.shrink());
+  }, skip: !Platform.isWindows);
+
   testWidgets('Windows editor exposes first and last lines after resize',
       (tester) async {
     final source = List.generate(160, (i) => '第 $i 行：长文档换行测试 ' * 5).join('\n');

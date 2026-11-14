@@ -11,6 +11,61 @@ import 'package:material_ui/material_ui.dart' as markdown_ui;
 
 import 'startup_arguments.dart';
 
+// Use installed Windows fonts; do not redistribute Segoe UI font files.
+const _readingFont = 'H2Readmd Segoe UI';
+const _chineseReadingFont = 'H2Readmd Source Han Sans';
+const _readingFallback = ['Segoe UI', _chineseReadingFont, 'Source Han Sans SC', 'Microsoft YaHei', 'Segoe UI Symbol'];
+
+Future<void> _loadWindowsReadingFont() async {
+  final windows = Platform.environment['WINDIR'] ?? r'C:\Windows';
+  try {
+    // Excluding Segoe UI Bold makes Markdown's w700 select Semibold (w600).
+    // Chinese falls back independently to Source Han Sans SC at w400/w700.
+    final fonts = await Future.wait(
+      ['segoeui.ttf', 'segoeuii.ttf', 'seguisb.ttf', 'seguisbi.ttf'].map(
+        (name) => File('$windows/Fonts/$name').readAsBytes(),
+      ),
+    );
+    final loader = FontLoader(_readingFont);
+    for (final bytes in fonts) {
+      loader.addFont(Future.value(ByteData.sublistView(bytes)));
+    }
+    await loader.load();
+  } catch (error) {
+    // Missing/inaccessible system fonts must not prevent opening documents.
+    debugPrint('Reading font unavailable; using system fallback: $error');
+  }
+}
+
+
+Future<void> _loadWindowsChineseFont() async {
+  final windows = Platform.environment['WINDIR'] ?? r'C:\Windows';
+  final localAppData = Platform.environment['LOCALAPPDATA'];
+  try {
+    final fonts = await Future.wait([
+      'SourceHanSansSC-Regular.otf',
+      'SourceHanSansSC-Bold.otf',
+      '思源黑体 CN RegularItalic.ttf',
+      '思源黑体 CN BoldItalic.ttf',
+    ].map((name) async {
+      final userFont = localAppData == null
+          ? null : File('$localAppData/Microsoft/Windows/Fonts/$name');
+      final file = userFont != null && await userFont.exists()
+          ? userFont : File('$windows/Fonts/$name');
+      return file.readAsBytes();
+    }));
+    // One family with real 400/700 upright and italic faces. FontLoader reads
+    // weight/slant from the font metadata, including the user's italic faces.
+    final loader = FontLoader(_chineseReadingFont);
+    for (final bytes in fonts) {
+      loader.addFont(Future.value(ByteData.sublistView(bytes)));
+    }
+    await loader.load();
+  } catch (error) {
+    debugPrint('Chinese font unavailable; using system fallback: $error');
+  }
+}
+
 ThemeData _neutralTheme(Brightness brightness) {
   final dark = brightness == Brightness.dark;
   final surface = Color(dark ? 0xFF202020 : 0xFFFFFFFF);
@@ -34,7 +89,7 @@ ThemeData _neutralTheme(Brightness brightness) {
   );
   return ThemeData(
     useMaterial3: true, colorScheme: scheme,
-    fontFamily: 'Microsoft YaHei', scaffoldBackgroundColor: surface,
+    fontFamily: _readingFont, fontFamilyFallback: _readingFallback, scaffoldBackgroundColor: surface,
     dividerColor: border,
     appBarTheme: AppBarTheme(
       backgroundColor: Color(dark ? 0xFF262626 : 0xFFF5F5F5),
@@ -49,8 +104,8 @@ ThemeData _neutralTheme(Brightness brightness) {
 }
 
 const _windowsBodyStyle = TextStyle(
-  fontFamily: 'Microsoft YaHei',
-  fontFamilyFallback: ['Microsoft YaHei UI', 'Segoe UI', 'Segoe UI Symbol'],
+  fontFamily: _readingFont,
+  fontFamilyFallback: _readingFallback,
   fontSize: 16,
   height: 1.6,
   fontWeight: FontWeight.w400,
@@ -63,6 +118,8 @@ Future<void> main(List<String> arguments) async {
   String initialText = '';
   String? startupError;
   if (Platform.isWindows) {
+    await _loadWindowsReadingFont();
+    await _loadWindowsChineseFont();
     await windowManager.ensureInitialized();
     await windowManager.setPreventClose(true);
     if (arguments.isNotEmpty) {
@@ -487,7 +544,14 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     final s = Theme.of(context).colorScheme;
     return markdown_ui.Theme(
       data: markdown_ui.ThemeData(
-        useMaterial3: true, fontFamily: 'Microsoft YaHei',
+        useMaterial3: true, fontFamily: _readingFont, fontFamilyFallback: _readingFallback,
+        // CodeField merges this style before applying its Consolas family.
+        // Keep the CJK fallback explicit for fenced code's Text.rich as well.
+        textTheme: markdown_ui.TextTheme(
+          bodyMedium: Theme.of(context).textTheme.bodyMedium?.copyWith(
+            fontFamilyFallback: const [_chineseReadingFont, 'Source Han Sans SC', 'Microsoft YaHei', 'Segoe UI Symbol'],
+          ),
+        ),
         colorScheme: markdown_ui.ColorScheme.fromSeed(
           seedColor: const Color(0xFF777777), brightness: s.brightness,
         ).copyWith(
@@ -534,8 +598,9 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
                         ? GptMarkdownStyleSheet(
                             heading: HeadingStyle(
                               textStyle: TextStyle(
-                                fontFamily: 'Microsoft YaHei',
-                                fontWeight: FontWeight.w600,
+                                fontFamily: _readingFont,
+                                fontFamilyFallback: _readingFallback,
+                                fontWeight: FontWeight.w700,
                                 height: 1.4,
                                 letterSpacing: 0,
                               ),
@@ -551,7 +616,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
                             ),
                             inlineCode: InlineCodeStyle(
                               fontFamily: 'Consolas',
-                              fontFamilyFallback: ['Microsoft YaHei', 'Segoe UI Symbol'],
+                              fontFamilyFallback: [_chineseReadingFont, 'Source Han Sans SC', 'Microsoft YaHei', 'Segoe UI Symbol'],
                               backgroundColor: Theme.of(context).colorScheme.surfaceContainer,
                               color: Theme.of(context).colorScheme.onSurface,
                               borderWidth: 0,

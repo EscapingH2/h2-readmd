@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -205,6 +206,78 @@ class _EditorScrollBehavior extends MaterialScrollBehavior {
 class _EditorPageState extends State<EditorPage> with WindowListener {
   static const _files = Filegate();
   final _controller = TextEditingController();
+  final _editorKey = GlobalKey();
+  final _editorFocus = FocusNode();
+  bool _imeGeometryQueued = false;
+  static const _desktopInput = MethodChannel('h2readmd/desktop_input');
+
+  void _inputTrace(String message) {
+    if (Platform.isWindows && Platform.environment['H2READMD_INPUT_TRACE'] == '1') {
+      unawaited(_desktopInput.invokeMethod<void>('trace', message)
+          .catchError((Object error) { debugPrint('Input trace unavailable: $error'); }));
+    }
+  }
+
+  EditableTextState? _editableState() {
+    EditableTextState? result;
+    void visit(Element element) {
+      if (element is StatefulElement && element.state is EditableTextState) {
+        result = element.state as EditableTextState;
+      } else {
+        element.visitChildren(visit);
+      }
+    }
+    _editorKey.currentContext?.visitChildElements(visit);
+    return result;
+  }
+
+  @override
+  void onWindowFocus() => _trackImeGeometry();
+
+
+  void _trackImeGeometry() {
+    _inputTrace('Dart geometry requested focus=${_editorFocus.hasFocus} queued=$_imeGeometryQueued selection=${_controller.selection.baseOffset},${_controller.selection.extentOffset} composing=${_controller.value.composing.start},${_controller.value.composing.end}');
+    if (Platform.isWindows && !_editorFocus.hasFocus) {
+      unawaited(_desktopInput.invokeMethod<void>('caretInactive')
+          .catchError((Object error) { debugPrint('IME caret reset failed: $error'); }));
+    }
+    if (!Platform.isWindows || !_editorFocus.hasFocus || _imeGeometryQueued) return;
+    _imeGeometryQueued = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      scheduleMicrotask(() {
+        _imeGeometryQueued = false;
+        if (!mounted || !_editorFocus.hasFocus || _view == ViewMode.preview || _exitCommitted) return;
+        final state = _editableState();
+        if (state == null || !_controller.selection.isValid) return;
+        final render = state.renderEditable;
+        final rect = render.getLocalRectForCaret(
+          TextPosition(offset: _controller.selection.extentOffset));
+        final point = render.localToGlobal(rect.bottomLeft);
+        final scale = View.of(state.context).devicePixelRatio;
+        _inputTrace('Dart caret x=${point.dx} y=${point.dy} scale=$scale');
+        unawaited(_desktopInput.invokeMethod<void>('caret',
+            <double>[point.dx * scale, point.dy * scale])
+            .catchError((Object error) { debugPrint('IME native caret failed: $error'); }));
+        // Enqueue both messages in order without waiting for platform replies.
+        // Selection/scroll/focus changes schedule fresh geometry, not a loop
+        // dependent on a future frame happening after an asynchronous reply.
+        for (final message in <String, Map<String, dynamic>>{
+          'TextInput.setEditableSizeAndTransform': {
+            'width': render.size.width, 'height': render.size.height,
+            'transform': render.getTransformTo(null).storage.toList(),
+          },
+          'TextInput.setMarkedTextRect': {
+            'x': rect.left, 'y': rect.top, 'width': rect.width, 'height': rect.height,
+          },
+        }.entries) {
+          unawaited(SystemChannels.textInput.invokeMethod<void>(message.key, message.value)
+              .catchError((Object error) { debugPrint('IME geometry update failed: $error'); }));
+        }
+      });
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
   final _editorScrollController = ScrollController();
   final _previewScrollController = ScrollController();
   double? _editorLayoutWidth;
@@ -232,6 +305,18 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     _savedText = widget.initialText;
     _controller.text = widget.initialText;
     _controller.addListener(_changed);
+    _editorFocus.addListener(_trackImeGeometry);
+    _editorScrollController.addListener(_trackImeGeometry);
+    if (Platform.isWindows) {
+      _desktopInput.setMethodCallHandler((call) async {
+        _inputTrace('Dart native request=${call.method} focus=${_editorFocus.hasFocus} view=$_view');
+        if (call.method == 'paste' && mounted && _editorFocus.hasFocus &&
+            _view != ViewMode.preview && !_handlingExit && !_exitCommitted) {
+          await _editableState()?.pasteText(SelectionChangedCause.keyboard);
+          _inputTrace('Dart paste completed');
+        }
+      });
+    }
     if (Platform.isWindows) windowManager.addListener(this);
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
@@ -250,6 +335,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
 
   void _changed() {
     setState(() {});
+    _trackImeGeometry();
     _syncWindowTitle();
   }
 
@@ -280,7 +366,11 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     if (Platform.isWindows) windowManager.removeListener(this);
     _controller.removeListener(_changed);
     _controller.dispose();
+    _editorFocus.removeListener(_trackImeGeometry);
+    _editorFocus.dispose();
+    _editorScrollController.removeListener(_trackImeGeometry);
     _editorScrollController.dispose();
+    if (Platform.isWindows) _desktopInput.setMethodCallHandler(null);
     _previewScrollController.dispose();
     super.dispose();
   }
@@ -487,7 +577,14 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   Widget _editor() {
     final editor = Container(
         color: Theme.of(context).colorScheme.surface,
-        child: TextField(
+        child: Shortcuts(
+          shortcuts: Platform.isWindows ? const <ShortcutActivator, Intent>{
+            SingleActivator(LogicalKeyboardKey.keyY, control: true):
+                RedoTextIntent(SelectionChangedCause.keyboard),
+          } : const <ShortcutActivator, Intent>{},
+          child: TextField(
+          key: _editorKey,
+          focusNode: _editorFocus,
           controller: _controller,
           maxLines: null,
           // Windows uses the panel's outer viewport; the field grows with text.
@@ -510,6 +607,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
             contentPadding: Platform.isWindows
                 ? const EdgeInsets.symmetric(horizontal: 20)
                 : const EdgeInsets.all(20),
+          ),
           ),
         ),
       );

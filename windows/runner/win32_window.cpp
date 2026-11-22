@@ -1,6 +1,7 @@
 #include "win32_window.h"
 
 #include <dwmapi.h>
+#include <algorithm>
 #include <flutter_windows.h>
 
 #include "resource.h"
@@ -25,6 +26,58 @@ constexpr const wchar_t kWindowClassName[] = L"FLUTTER_RUNNER_WIN32_WINDOW";
 constexpr const wchar_t kGetPreferredBrightnessRegKey[] =
   L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 constexpr const wchar_t kGetPreferredBrightnessRegValue[] = L"AppsUseLightTheme";
+
+// One atomic per-user value; independent processes use last-close-wins.
+constexpr const wchar_t kPlacementKey[] = L"Software\\H2Readmd";
+struct SavedPlacement {
+  DWORD version;
+  RECT normal_screen;
+  DWORD maximized;
+};
+
+void SavePlacement(HWND hwnd) {
+  WINDOWPLACEMENT placement{};
+  placement.length = sizeof(placement);
+  MONITORINFO info{};
+  info.cbSize = sizeof(info);
+  if (!GetWindowPlacement(hwnd, &placement) ||
+      !GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &info)) return;
+  RECT rect = placement.rcNormalPosition;
+  // WINDOWPLACEMENT uses workspace coordinates for ordinary top-level windows.
+  OffsetRect(&rect, info.rcWork.left - info.rcMonitor.left,
+                   info.rcWork.top - info.rcMonitor.top);
+  SavedPlacement saved{1, rect,
+    (placement.showCmd == SW_SHOWMAXIMIZED ||
+     (placement.showCmd == SW_SHOWMINIMIZED && (placement.flags & WPF_RESTORETOMAXIMIZED))) ? 1UL : 0UL};
+  HKEY key;
+  if (RegCreateKeyEx(HKEY_CURRENT_USER, kPlacementKey, 0, nullptr, 0,
+                    KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+    RegSetValueEx(key, L"WindowPlacement", 0, REG_BINARY,
+                  reinterpret_cast<const BYTE*>(&saved), sizeof(saved));
+    RegCloseKey(key);
+  }
+}
+
+bool RestorePlacement(HWND hwnd) {
+  SavedPlacement saved{};
+  DWORD bytes = sizeof(saved);
+  if (RegGetValue(HKEY_CURRENT_USER, kPlacementKey, L"WindowPlacement",
+      RRF_RT_REG_BINARY, nullptr, &saved, &bytes) != ERROR_SUCCESS ||
+      bytes != sizeof(saved) || saved.version != 1 || saved.maximized > 1) return false;
+  RECT rect = saved.normal_screen;
+  const auto width = static_cast<long long>(rect.right) - rect.left;
+  const auto height = static_cast<long long>(rect.bottom) - rect.top;
+  if (width < 100 || height < 100 || width > 100000 || height > 100000) return false;
+  MONITORINFO info{};
+  info.cbSize = sizeof(info);
+  if (!GetMonitorInfo(MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST), &info)) return false;
+  const LONG w = std::min(static_cast<LONG>(width), info.rcWork.right - info.rcWork.left);
+  const LONG h = std::min(static_cast<LONG>(height), info.rcWork.bottom - info.rcWork.top);
+  const LONG x = std::clamp(rect.left, info.rcWork.left, info.rcWork.right - w);
+  const LONG y = std::clamp(rect.top, info.rcWork.top, info.rcWork.bottom - h);
+  SetWindowPos(hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+  return saved.maximized != 0;
+}
 
 // The number of Win32Window objects that currently exist.
 static int g_active_window_count = 0;
@@ -144,13 +197,14 @@ bool Win32Window::Create(const std::wstring& title,
     return false;
   }
 
+  restore_maximized_ = RestorePlacement(window);
   UpdateTheme(window);
 
   return OnCreate();
 }
 
 bool Win32Window::Show() {
-  return ShowWindow(window_handle_, SW_SHOWNORMAL);
+  return ShowWindow(window_handle_, restore_maximized_ ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
 }
 
 // static
@@ -167,6 +221,7 @@ LRESULT CALLBACK Win32Window::WndProc(HWND const window,
     EnableFullDpiSupportIfAvailable(window);
     that->window_handle_ = window;
   } else if (Win32Window* that = GetThisFromHandle(window)) {
+    if (message == WM_DESTROY) SavePlacement(window);
     return that->MessageHandler(window, message, wparam, lparam);
   }
 
@@ -208,7 +263,7 @@ Win32Window::MessageHandler(HWND hwnd,
     }
 
     case WM_ACTIVATE:
-      if (child_content_ != nullptr) {
+      if (LOWORD(wparam) != WA_INACTIVE && child_content_ != nullptr) {
         SetFocus(child_content_);
       }
       return 0;

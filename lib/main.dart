@@ -11,6 +11,9 @@ import 'package:window_manager/window_manager.dart';
 import 'package:material_ui/material_ui.dart' as markdown_ui;
 
 import 'startup_arguments.dart';
+import 'document_find.dart';
+import 'document_history.dart';
+import 'find_preview.dart';
 
 // Use installed Windows fonts; do not redistribute Segoe UI font files.
 const _readingFont = 'H2Readmd Segoe UI';
@@ -205,7 +208,128 @@ class _EditorScrollBehavior extends MaterialScrollBehavior {
 
 class _EditorPageState extends State<EditorPage> with WindowListener {
   static const _files = Filegate();
-  final _controller = TextEditingController();
+  final _controller = FindEditingController();
+  final _query = TextEditingController();
+  final _replacement = TextEditingController();
+  final _queryFocus = FocusNode();
+  final _replacementFocus = FocusNode();
+  final _previewFocus = FocusNode();
+  final _queryKey = GlobalKey();
+  final _replacementKey = GlobalKey();
+  final _previewKey = GlobalKey();
+  late final DocumentHistory _documentUndo;
+  bool _panelOpen = false;
+  bool _replaceMode = false;
+  bool _returnToPreview = false;
+  String _previewSelection = '';
+  PreviewFindMap? _previewMap;
+  int _revealGeneration = 0;
+  DocumentFind get _find => _controller.find;
+  bool get _fieldFocused => _editorFocus.hasFocus || _queryFocus.hasFocus || _replacementFocus.hasFocus;
+  GlobalKey get _activeFieldKey => _queryFocus.hasFocus ? _queryKey :
+      _replacementFocus.hasFocus ? _replacementKey : _editorKey;
+
+  void _openFind(bool replace) {
+    if (!_panelOpen) {
+      _returnToPreview = _view == ViewMode.preview || _previewFocus.hasFocus;
+      final selection = _controller.selection;
+      final seed = _returnToPreview ? _previewSelection :
+          selection.isValid ? selection.textInside(_controller.text) : '';
+      if (seed.isNotEmpty) _query.text = seed;
+    }
+    setState(() {
+      _panelOpen = true;
+      _replaceMode = replace;
+    });
+    _refreshFind();
+    _query.selection = TextSelection(baseOffset: 0, extentOffset: _query.text.length);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _panelOpen) _queryFocus.requestFocus();
+    });
+  }
+
+  void _closeFind() {
+    _revealGeneration++;
+    setState(() {
+      _panelOpen = false;
+      _find.update(_controller.text, '', _find.matchCase);
+      _previewMap = null;
+    });
+    if (_view == ViewMode.preview || (_returnToPreview && _view == ViewMode.both)) {
+      _previewFocus.requestFocus();
+    } else {
+      _editorFocus.requestFocus();
+    }
+  }
+
+  void _refreshFind({int? anchor, bool reveal = true}) {
+    if (!_panelOpen) return;
+    if (_find.source != _controller.text) _previewMap = null;
+    setState(() {
+      _find.update(_controller.text, _query.text, _find.matchCase, anchor: anchor);
+      if (_find.hits.isNotEmpty) _previewMap ??= PreviewFindMap(_controller.text);
+    });
+    if (reveal) {
+      _revealFind();
+    } else {
+      _revealGeneration++;
+    }
+  }
+
+  PreviewFindPainter _previewPainter() => PreviewFindPainter(_previewKey,
+      _previewScrollController, _find, _previewMap!, Theme.of(context).colorScheme);
+
+  void _revealFind() {
+    final generation = ++_revealGeneration;
+    final hit = _find.current;
+    if (hit == null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || generation != _revealGeneration) return;
+      final render = _editableState()?.renderEditable;
+      if (render != null && _editorScrollController.hasClients) {
+        final viewport = _editorScrollController.position.context.notificationContext?.findRenderObject();
+        if (viewport is RenderBox) {
+          final caret = render.getLocalRectForCaret(TextPosition(offset: hit.start));
+          final y = render.localToGlobal(caret.topLeft).dy - viewport.localToGlobal(Offset.zero).dy;
+          final pos = _editorScrollController.position;
+          _editorScrollController.jumpTo((pos.pixels + y - pos.viewportDimension * .4)
+              .clamp(pos.minScrollExtent, pos.maxScrollExtent).toDouble());
+        }
+      }
+      final painter = _previewPainter();
+      void preview(Duration _) {
+        if (!mounted || generation != _revealGeneration || _view == ViewMode.editor) return;
+        if (!painter.reveal()) {
+          WidgetsBinding.instance.addPostFrameCallback(preview);
+          WidgetsBinding.instance.ensureVisualUpdate();
+        }
+      }
+      preview(Duration.zero);
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  void _setView(ViewMode mode) {
+    setState(() => _view = mode);
+    if (_panelOpen) _revealFind();
+  }
+
+  void _moveFind(int delta) {
+    setState(() => _find.move(delta));
+    _revealFind();
+  }
+
+  void _replaceFind(bool all) {
+    final hit = _find.current;
+    if (hit == null) return;
+    final insert = _replacement.text;
+    final next = _find.replace(insert, all: all);
+    final end = (hit.start + insert.length).clamp(0, next.length);
+    _documentUndo.replace(TextEditingValue(text: next, selection: TextSelection.collapsed(offset: end)));
+    _refreshFind(anchor: all ? 0 : end);
+    (_view == ViewMode.preview ? _previewFocus : _editorFocus).requestFocus();
+  }
+
   final _editorKey = GlobalKey();
   final _editorFocus = FocusNode();
   bool _imeGeometryQueued = false;
@@ -218,7 +342,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     }
   }
 
-  EditableTextState? _editableState() {
+  EditableTextState? _editableState([GlobalKey? fieldKey]) {
     EditableTextState? result;
     void visit(Element element) {
       if (element is StatefulElement && element.state is EditableTextState) {
@@ -227,7 +351,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
         element.visitChildren(visit);
       }
     }
-    _editorKey.currentContext?.visitChildElements(visit);
+    (fieldKey ?? _editorKey).currentContext?.visitChildElements(visit);
     return result;
   }
 
@@ -237,21 +361,22 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
 
   void _trackImeGeometry() {
     _inputTrace('Dart geometry requested focus=${_editorFocus.hasFocus} queued=$_imeGeometryQueued selection=${_controller.selection.baseOffset},${_controller.selection.extentOffset} composing=${_controller.value.composing.start},${_controller.value.composing.end}');
-    if (Platform.isWindows && !_editorFocus.hasFocus) {
+    if (Platform.isWindows && !_fieldFocused) {
       unawaited(_desktopInput.invokeMethod<void>('caretInactive')
           .catchError((Object error) { debugPrint('IME caret reset failed: $error'); }));
     }
-    if (!Platform.isWindows || !_editorFocus.hasFocus || _imeGeometryQueued) return;
+    if (!Platform.isWindows || !_fieldFocused || _imeGeometryQueued) return;
     _imeGeometryQueued = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       scheduleMicrotask(() {
         _imeGeometryQueued = false;
-        if (!mounted || !_editorFocus.hasFocus || _view == ViewMode.preview || _exitCommitted) return;
-        final state = _editableState();
-        if (state == null || !_controller.selection.isValid) return;
+        if (!mounted || !_fieldFocused || _exitCommitted) return;
+        final state = _editableState(_activeFieldKey);
+        final selection = state?.widget.controller.selection;
+        if (state == null || selection == null || !selection.isValid) return;
         final render = state.renderEditable;
         final rect = render.getLocalRectForCaret(
-          TextPosition(offset: _controller.selection.extentOffset));
+          TextPosition(offset: selection.extentOffset));
         final point = render.localToGlobal(rect.bottomLeft);
         final scale = View.of(state.context).devicePixelRatio;
         _inputTrace('Dart caret x=${point.dx} y=${point.dy} scale=$scale');
@@ -304,15 +429,19 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     if (_path != null) _name = File(_path!).uri.pathSegments.last;
     _savedText = widget.initialText;
     _controller.text = widget.initialText;
+    if (Platform.isWindows) _documentUndo = DocumentHistory(_controller);
     _controller.addListener(_changed);
     _editorFocus.addListener(_trackImeGeometry);
+    _queryFocus.addListener(_trackImeGeometry);
+    _replacementFocus.addListener(_trackImeGeometry);
+    _query.addListener(_trackImeGeometry);
+    _replacement.addListener(_trackImeGeometry);
     _editorScrollController.addListener(_trackImeGeometry);
     if (Platform.isWindows) {
       _desktopInput.setMethodCallHandler((call) async {
         _inputTrace('Dart native request=${call.method} focus=${_editorFocus.hasFocus} view=$_view');
-        if (call.method == 'paste' && mounted && _editorFocus.hasFocus &&
-            _view != ViewMode.preview && !_handlingExit && !_exitCommitted) {
-          await _editableState()?.pasteText(SelectionChangedCause.keyboard);
+        if (call.method == 'paste' && mounted && _fieldFocused && !_handlingExit && !_exitCommitted) {
+          await _editableState(_activeFieldKey)?.pasteText(SelectionChangedCause.keyboard);
           _inputTrace('Dart paste completed');
         }
       });
@@ -334,7 +463,11 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   }
 
   void _changed() {
-    setState(() {});
+    if (_panelOpen && _controller.text != _find.source) {
+      _refreshFind(reveal: false);
+    } else {
+      setState(() {});
+    }
     _trackImeGeometry();
     _syncWindowTitle();
   }
@@ -365,7 +498,13 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   void dispose() {
     if (Platform.isWindows) windowManager.removeListener(this);
     _controller.removeListener(_changed);
+    if (Platform.isWindows) _documentUndo.dispose();
     _controller.dispose();
+    _query.dispose();
+    _replacement.dispose();
+    _queryFocus.dispose();
+    _replacementFocus.dispose();
+    _previewFocus.dispose();
     _editorFocus.removeListener(_trackImeGeometry);
     _editorFocus.dispose();
     _editorScrollController.removeListener(_trackImeGeometry);
@@ -613,6 +752,10 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
       );
 
     if (!Platform.isWindows) return editor;
+    final documentEditor = Actions(actions: {
+      UndoTextIntent: CallbackAction<UndoTextIntent>(onInvoke: (_) => _documentUndo.undo()),
+      RedoTextIntent: CallbackAction<RedoTextIntent>(onInvoke: (_) => _documentUndo.redo()),
+    }, child: editor);
     return Scrollbar(
       controller: _editorScrollController,
       scrollbarOrientation: ScrollbarOrientation.right,
@@ -629,7 +772,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
               constraints: BoxConstraints(
                 minHeight: (constraints.maxHeight - 20).clamp(0.0, double.infinity).toDouble(),
               ),
-              child: editor,
+              child: documentEditor,
             ),
           );
         }),
@@ -673,7 +816,12 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   Widget _preview() => Container(
         color: Theme.of(context).colorScheme.surface,
         child: _markdownTheme(SelectionArea(
-          child: CustomScrollView(
+          focusNode: _previewFocus,
+          onSelectionChanged: (content) => _previewSelection = content?.plainText ?? '',
+          child: CustomPaint(
+            key: _previewKey,
+            foregroundPainter: _panelOpen && _find.hits.isNotEmpty ? _previewPainter() : null,
+            child: CustomScrollView(
             controller: _previewScrollController,
             primary: false,
             slivers: [
@@ -759,7 +907,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
               ),
             ],
           ),
-        )),
+        ))),
       );
 
   Widget _viewControl({bool compact = false}) {
@@ -775,7 +923,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
           icon: compact ? const Icon(Icons.article_outlined, size: 18) : null, tooltip: '预览'),
       ],
       selected: {_view},
-      onSelectionChanged: (value) => setState(() => _view = value.first),
+      onSelectionChanged: (value) => _setView(value.first),
       style: ButtonStyle(
         minimumSize: const WidgetStatePropertyAll(Size(0, 34)),
         padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 10)),
@@ -794,14 +942,16 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   Widget _toolbarMore({required bool collapsed, required bool includeSave, bool includeViews = false}) => PopupMenuButton<String>(
     tooltip: '更多', iconSize: 21,
     onSelected: (value) {
+      if (value == 'find') _openFind(false);
+      if (value == 'replace') _openFind(true);
       if (value == 'new') _newFile();
       if (value == 'open') _open();
       if (value == 'save') _save();
       if (value == 'saveAs') _save(saveAs: true);
       if (value == 'theme') widget.onThemeToggle();
-      if (value == 'both') setState(() => _view = ViewMode.both);
-      if (value == 'editor') setState(() => _view = ViewMode.editor);
-      if (value == 'preview') setState(() => _view = ViewMode.preview);
+      if (value == 'both') _setView(ViewMode.both);
+      if (value == 'editor') _setView(ViewMode.editor);
+      if (value == 'preview') _setView(ViewMode.preview);
       if (value == 'reset') setState(() { _view = ViewMode.both; _editorFraction = .5; });
     },
     itemBuilder: (_) => [
@@ -809,6 +959,8 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
       if (collapsed) const PopupMenuItem(value: 'open', child: Text('打开')),
       if (includeSave) PopupMenuItem(value: 'save', enabled: !_busy, child: const Text('保存')),
       PopupMenuItem(value: 'saveAs', enabled: !_busy, child: const Text('另存为')),
+      const PopupMenuItem(value: 'find', child: Text('查找  Ctrl+F')),
+      const PopupMenuItem(value: 'replace', child: Text('替换  Ctrl+H')),
       if (includeViews) const PopupMenuItem(value: 'both', child: Text('分栏')),
       if (includeViews) const PopupMenuItem(value: 'editor', child: Text('编辑')),
       if (includeViews) const PopupMenuItem(value: 'preview', child: Text('预览')),
@@ -841,7 +993,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
               ? PopupMenuButton<ViewMode>(
                   tooltip: '视图', padding: EdgeInsets.zero,
                   icon: const Icon(Icons.view_week_outlined, size: 21),
-                  onSelected: (value) => setState(() => _view = value),
+                  onSelected: (value) => _setView(value),
                   itemBuilder: (_) => ViewMode.values.map((mode) => CheckedPopupMenuItem(
                     value: mode, checked: mode == _view,
                     child: Text(['分栏', '编辑', '预览'][mode.index]))).toList(),
@@ -903,7 +1055,102 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
           ),
         ),
       ),
+      if (_panelOpen) Positioned(top: 8, right: 8,
+        width: (width - 16).clamp(0, 410).toDouble(),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: (constraints.maxHeight - 16).clamp(0.0, double.infinity)),
+          child: SingleChildScrollView(child: _findPanel()),
+        )),
     ]);
+  }
+
+  Widget _findPanel() {
+    final colors = Theme.of(context).colorScheme;
+    final enabled = _find.current != null;
+    const radius = BorderRadius.all(Radius.circular(6));
+    final border = OutlineInputBorder(
+      borderRadius: radius, borderSide: BorderSide(color: colors.outlineVariant));
+    final focusedBorder = border.copyWith(borderSide: BorderSide(width: 1.5,
+      color: Color.alphaBlend(colors.onSurfaceVariant.withValues(alpha: .5), colors.outlineVariant)));
+    final buttonStyle = ButtonStyle(
+      visualDensity: VisualDensity.standard,
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      minimumSize: const WidgetStatePropertyAll(Size(32, 32)),
+      padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 8)),
+      shape: const WidgetStatePropertyAll(RoundedRectangleBorder(borderRadius: radius)),
+      foregroundColor: WidgetStateProperty.resolveWith((states) => states.contains(WidgetState.disabled)
+          ? colors.onSurface.withValues(alpha: .38) : colors.onSurface),
+      backgroundColor: WidgetStateProperty.resolveWith((states) => states.contains(WidgetState.selected)
+          ? colors.secondaryContainer : Colors.transparent),
+      overlayColor: WidgetStateProperty.resolveWith((states) {
+        if (states.contains(WidgetState.pressed)) return colors.onSurface.withValues(alpha: .14);
+        if (states.contains(WidgetState.focused)) return colors.onSurface.withValues(alpha: .12);
+        if (states.contains(WidgetState.hovered)) return colors.onSurface.withValues(alpha: .07);
+        return Colors.transparent;
+      }),
+    );
+    final iconStyle = buttonStyle.copyWith(
+      fixedSize: const WidgetStatePropertyAll(Size.square(32)),
+      iconSize: const WidgetStatePropertyAll(18),
+      iconColor: buttonStyle.foregroundColor,
+      padding: const WidgetStatePropertyAll(EdgeInsets.zero),
+    );
+    Widget field(bool replace) => TextField(
+      key: replace ? _replacementKey : _queryKey,
+      controller: replace ? _replacement : _query,
+      focusNode: replace ? _replacementFocus : _queryFocus,
+      onChanged: replace ? null : (_) => _refreshFind(anchor: 0),
+      decoration: InputDecoration(isDense: true, filled: true, fillColor: colors.surface,
+        border: border, enabledBorder: border, focusedBorder: focusedBorder,
+        hintText: replace ? '替换为' : '查找内容',
+        contentPadding: const EdgeInsets.symmetric(horizontal: 9, vertical: 8)),
+    );
+    Widget button(String tip, Widget icon, VoidCallback? action, {bool? selected}) => IconButton(
+      tooltip: tip, style: iconStyle, isSelected: selected, onPressed: action, icon: icon);
+    Widget arrow(bool up) => Builder(builder: (context) => CustomPaint(
+      size: const Size.square(18),
+      painter: _FindChevron(up, IconTheme.of(context).color ?? colors.onSurface)));
+    final actions = Wrap(spacing: 2, alignment: WrapAlignment.end,
+      crossAxisAlignment: WrapCrossAlignment.center, children: [
+      Padding(padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Text('${_find.index + 1}/${_find.hits.length}',
+          style: Theme.of(context).textTheme.labelMedium?.copyWith(color: colors.onSurfaceVariant))),
+      button('区分大小写', const Text('Aa', style: TextStyle(fontSize: 14)),
+        () { _find.matchCase = !_find.matchCase; _refreshFind(); }, selected: _find.matchCase),
+      button('上一个', arrow(true), enabled ? () => _moveFind(-1) : null),
+      button('下一个', arrow(false), enabled ? () => _moveFind(1) : null),
+      button('关闭查找', const Icon(Icons.close), _closeFind),
+    ]);
+    final replaceActions = Wrap(spacing: 2, alignment: WrapAlignment.end, children: [
+      TextButton(style: buttonStyle, onPressed: enabled ? () => _replaceFind(false) : null, child: const Text('替换')),
+      TextButton(style: buttonStyle, onPressed: enabled ? () => _replaceFind(true) : null, child: const Text('全部替换')),
+    ]);
+    return Material(elevation: 3, color: colors.surfaceContainerLow,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8),
+        side: BorderSide(color: colors.outlineVariant)),
+      child: Padding(padding: const EdgeInsets.all(6), child: LayoutBuilder(builder: (_, box) {
+        Widget row(Widget input, Widget controls) => box.maxWidth < 320
+            ? Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                input, const SizedBox(height: 4), Align(alignment: Alignment.centerRight, child: controls)])
+            : Row(children: [Expanded(child: input), const SizedBox(width: 6),
+                SizedBox(width: box.maxWidth * .52,
+                  child: Align(alignment: Alignment.centerRight, child: controls))]);
+        return Focus(onKeyEvent: (_, event) {
+          if (event is! KeyDownEvent && event is! KeyRepeatEvent) return KeyEventResult.ignored;
+          final value = (_replacementFocus.hasFocus ? _replacement : _query).value;
+          if (value.composing.isValid && !value.composing.isCollapsed) return KeyEventResult.ignored;
+          if (event.logicalKey == LogicalKeyboardKey.escape) {
+            _closeFind();
+          } else if (event.logicalKey == LogicalKeyboardKey.enter ||
+              event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+            _moveFind(HardwareKeyboard.instance.isShiftPressed ? -1 : 1);
+          } else { return KeyEventResult.ignored; }
+          return KeyEventResult.handled;
+        }, child: Column(mainAxisSize: MainAxisSize.min, children: [
+          row(field(false), actions),
+          if (_replaceMode) ...[const SizedBox(height: 4), row(field(true), replaceActions)],
+        ]));
+      })));
   }
 
   @override
@@ -962,7 +1209,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
                       ButtonSegment(value: ViewMode.preview, label: Text('预览')),
                     ],
               selected: {visible},
-              onSelectionChanged: (value) => setState(() => _view = value.first),
+              onSelectionChanged: (value) => _setView(value.first),
             ),
           ),
           Expanded(
@@ -978,11 +1225,61 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     if (!Platform.isWindows) return page;
     return CallbackShortcuts(
       bindings: {
+        const SingleActivator(LogicalKeyboardKey.keyF, control: true): () => _openFind(false),
+        const SingleActivator(LogicalKeyboardKey.keyH, control: true): () => _openFind(true),
+        if (_panelOpen) const SingleActivator(LogicalKeyboardKey.escape): () {
+          final composing = (_replacementFocus.hasFocus ? _replacement : _query).value.composing;
+          if (!_fieldFocused || !composing.isValid || composing.isCollapsed) _closeFind();
+        },
         const SingleActivator(LogicalKeyboardKey.keyS, control: true): () {
           if (!_handlingExit && !_exitCommitted) _save();
         },
       },
-      child: Focus(autofocus: true, child: page),
+      child: Focus(autofocus: true, onKeyEvent: (_, event) {
+        // Text fields handle their own intents. Check focus at dispatch time:
+        // a toolbar button or the preview can gain focus without rebuilding.
+        if (_fieldFocused || (!_panelOpen && !_previewFocus.hasFocus) ||
+            (event is! KeyDownEvent && event is! KeyRepeatEvent)) {
+          return KeyEventResult.ignored;
+        }
+        final keys = HardwareKeyboard.instance;
+        if (!keys.isControlPressed || keys.isAltPressed || keys.isMetaPressed) return KeyEventResult.ignored;
+        if (event.logicalKey == LogicalKeyboardKey.keyZ) {
+          keys.isShiftPressed ? _documentUndo.redo() : _documentUndo.undo();
+        } else if (event.logicalKey == LogicalKeyboardKey.keyY && !keys.isShiftPressed) {
+          _documentUndo.redo();
+        } else {
+          return KeyEventResult.ignored;
+        }
+        return KeyEventResult.handled;
+      }, child: page),
     );
   }
+}
+
+/// Draw the navigation marks at desktop control size, independently of
+/// which Material icon glyphs are present in the installed font subset.
+class _FindChevron extends CustomPainter {
+  const _FindChevron(this.up, this.color);
+  final bool up;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = size.center(Offset.zero);
+    final dy = up ? 2.25 : -2.25;
+    final path = Path()
+      ..moveTo(center.dx - 4.5, center.dy + dy)
+      ..lineTo(center.dx, center.dy - dy)
+      ..lineTo(center.dx + 4.5, center.dy + dy);
+    canvas.drawPath(path, Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.75
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round);
+  }
+
+  @override
+  bool shouldRepaint(_FindChevron old) => old.up != up || old.color != color;
 }

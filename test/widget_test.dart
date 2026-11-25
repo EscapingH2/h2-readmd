@@ -1,11 +1,16 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:markdown_reader/main.dart';
+import 'package:markdown_reader/find_preview.dart';
+import 'package:markdown_reader/document_find.dart';
+import 'package:markdown_reader/document_history.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -48,6 +53,234 @@ void main() {
         of: find.byType(SliverGptMarkdown),
         matching: find.textContaining(text, findRichText: true),
       );
+
+  test('Literal multiline replacements preserve CRLF, Unicode and replacement characters', () {
+    final find = DocumentFind();
+    const source = '甲.*\r\n😄甲.*\r\n尾';
+    find.update(source, '.*\r\n', false);
+    expect(find.hits.length, 2);
+    find.move(-1);
+    expect(find.replace('', all: false), '甲.*\r\n😄甲尾');
+    expect(find.replace(r'$1', all: true), r'甲$1😄甲$1尾');
+    find.update(source, '', false);
+    expect(find.current, isNull);
+  });
+
+  testWidgets('Find uses source matches, retains query across modes and undoes replace all', (tester) async {
+    const original = '[Word](Word) word 中文';
+    await startApp(tester, const MarkdownApp(initialText: original));
+    final editor = tester.widget<TextField>(find.byType(TextField));
+    editor.focusNode!.requestFocus();
+    editor.controller!.selection = const TextSelection(baseOffset: 1, extentOffset: 5);
+    Future<void> shortcut(LogicalKeyboardKey key, {bool shift = false}) async {
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      if (shift) await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyEvent(key);
+      if (shift) await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pumpAndSettle();
+    }
+    await tester.pump(const Duration(seconds: 1));
+    await shortcut(LogicalKeyboardKey.keyF);
+    PreviewFindPainter previewHighlights() => tester.widgetList<CustomPaint>(
+        find.byType(CustomPaint)).map((p) => p.foregroundPainter)
+        .whereType<PreviewFindPainter>().single;
+    final label = previewHighlights().currentGlyphBox();
+    expect(label, isNotNull);
+    expect(find.text('1/3'), findsOneWidget);
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+    expect(find.text('2/3'), findsOneWidget);
+    expect(previewHighlights().currentGlyphBox(), isNull); // Hidden URL.
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+    expect(previewHighlights().currentGlyphBox()!.left, greaterThan(label!.left));
+    await tester.tap(find.byTooltip('上一个'));
+    await tester.pump();
+    await tester.tap(find.text('Aa'));
+    await tester.pump();
+    expect(find.text('2/2'), findsOneWidget);
+    await shortcut(LogicalKeyboardKey.keyH);
+    for (final width in [1200.0, 300.0]) {
+      await tester.binding.setSurfaceSize(Size(width, 800));
+      await tester.pumpAndSettle();
+      final query = tester.getRect(find.widgetWithText(TextField, '查找内容'));
+      final replacement = tester.getRect(find.widgetWithText(TextField, '替换为'));
+      expect(query.left, replacement.left);
+      expect(query.right, replacement.right);
+      expect(tester.getCenter(find.text('2/2')).dx, lessThan(tester.getCenter(find.text('Aa')).dx));
+      expect(tester.takeException(), isNull);
+    }
+    await tester.binding.setSurfaceSize(const Size(1200, 800));
+    await tester.pumpAndSettle();
+    expect(find.text('2/2'), findsOneWidget);
+    expect(editor.controller!.text, original);
+    await tester.enterText(find.widgetWithText(TextField, '替换为'), '新');
+    await tester.tap(find.text('全部替换'));
+    await tester.pumpAndSettle();
+    expect(editor.controller!.text, '[新](新) word 中文');
+    expect(find.text('0/0'), findsOneWidget);
+    expect(tester.widget<TextButton>(find.widgetWithText(TextButton, '替换')).onPressed, isNull);
+    expect(tester.widget<TextButton>(find.widgetWithText(TextButton, '全部替换')).onPressed, isNull);
+    expect(tester.widget<IconButton>(find.byWidgetPredicate((w) => w is IconButton && w.tooltip == '上一个')).onPressed, isNull);
+    await tester.pump(const Duration(seconds: 1));
+    await shortcut(LogicalKeyboardKey.keyZ);
+    expect(editor.controller!.text, original);
+    await shortcut(LogicalKeyboardKey.keyY);
+    expect(editor.controller!.text, '[新](新) word 中文');
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(find.byType(TextField), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+  }, skip: !Platform.isWindows);
+
+  test('Typing, replacement, and later typing have distinct history boundaries', () {
+    final doc = TextEditingController(text: '甲');
+    final history = DocumentHistory(doc);
+    addTearDown(() { history.dispose(); doc.dispose(); });
+    doc.text = '甲乙';
+    doc.selection = const TextSelection.collapsed(offset: 1);
+    history.replace(const TextEditingValue(text: '甲丙', selection: TextSelection.collapsed(offset: 2)));
+    doc.text = '甲丙丁';
+    history.undo();
+    expect(doc.text, '甲丙');
+    history.undo();
+    expect(doc.text, '甲乙');
+    expect(doc.selection.extentOffset, 1);
+    history.undo();
+    expect(doc.text, '甲');
+    history.redo();
+    expect(doc.text, '甲乙');
+    doc.selection = const TextSelection.collapsed(offset: 0);
+    history.redo();
+    expect(doc.text, '甲丙');
+    doc.text = '新分支';
+    history.redo();
+    expect(doc.text, '新分支');
+  });
+
+  for (final previewOnly in [false, true]) {
+    testWidgets('Rapid replacements have separate undo and redo steps (preview=$previewOnly)', (tester) async {
+      await startApp(tester, const MarkdownApp(initialText: 'old old old'));
+      final doc = tester.widget<TextField>(find.byType(TextField)).controller!;
+      if (previewOnly) {
+        await tester.tap(find.text('预览'));
+        await tester.pump();
+      }
+      Future<void> ctrl(LogicalKeyboardKey key) async {
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyEvent(key);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pump();
+      }
+      await ctrl(LogicalKeyboardKey.keyH);
+      await tester.enterText(find.widgetWithText(TextField, '查找内容'), 'old');
+      await tester.enterText(find.widgetWithText(TextField, '替换为'), 'new');
+      await tester.tap(find.text('替换'));
+      await tester.pump();
+      expect(doc.text, 'new old old');
+      await tester.tap(find.text('全部替换'));
+      await tester.pump();
+      expect(doc.text, 'new new new');
+      await ctrl(LogicalKeyboardKey.keyZ);
+      expect(doc.text, 'new old old');
+      await ctrl(LogicalKeyboardKey.keyZ);
+      expect(doc.text, 'old old old');
+      await ctrl(LogicalKeyboardKey.keyY);
+      expect(doc.text, 'new old old');
+      await ctrl(LogicalKeyboardKey.keyY);
+      expect(doc.text, 'new new new');
+      await tester.pumpWidget(const SizedBox.shrink());
+    }, skip: !Platform.isWindows);
+  }
+
+  for (final brightness in Brightness.values) {
+    testWidgets('Find paints readable preview text and both chevrons in $brightness', (tester) async {
+      tester.platformDispatcher.platformBrightnessTestValue = brightness;
+      addTearDown(tester.platformDispatcher.clearPlatformBrightnessTestValue);
+      await tester.binding.setSurfaceSize(const Size(1200, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final capture = GlobalKey();
+      await tester.pumpWidget(RepaintBoundary(key: capture, child: const MarkdownApp(initialText: 'A A')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('更多'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('查找  Ctrl+F'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.widgetWithText(TextField, '查找内容'), 'A A');
+      await tester.pumpAndSettle();
+
+      final preview = find.byWidgetPredicate((w) => w is CustomPaint && w.foregroundPainter is PreviewFindPainter);
+      final painter = tester.widget<CustomPaint>(preview).foregroundPainter! as PreviewFindPainter;
+      final glyph = painter.currentGlyphBox()!.shift(tester.getTopLeft(preview));
+      final surface = painter.colors.surface;
+      final ink = painter.colors.onSurface;
+      final highlight = Color.alphaBlend(findHighlight(true, brightness), surface);
+      final boundary = capture.currentContext!.findRenderObject()! as RenderRepaintBoundary;
+      // Inspect the composited pixels, including the viewport's repaint layers.
+      final image = boundary.toImageSync();
+      final pixels = (await tester.runAsync(() => image.toByteData(format: ui.ImageByteFormat.rawRgba)))!;
+      bool hasColor(Rect box, Color color) {
+        final rgb = color.toARGB32();
+        for (var y = box.top.ceil(); y < box.bottom.floor(); y++) {
+          for (var x = box.left.ceil(); x < box.right.floor(); x++) {
+            final offset = (y * image.width + x) * 4;
+            if ([0, 1, 2].every((c) =>
+                (pixels.getUint8(offset + c) - ((rgb >> (16 - c * 8)) & 255)).abs() <= 2)) {
+              return true;
+            }
+          }
+        }
+        return false;
+      }
+      try {
+        expect(hasColor(glyph, ink), isTrue, reason: 'Preview glyph retains its text color');
+        expect(hasColor(glyph.inflate(1), highlight), isTrue, reason: 'Preview uses editor highlight color');
+        for (final tip in ['上一个', '下一个']) {
+          expect(hasColor(tester.getRect(find.byTooltip(tip)).deflate(7), ink), isTrue, reason: tip);
+        }
+      } finally {
+        image.dispose();
+      }
+      await tester.pumpWidget(const SizedBox.shrink());
+    }, skip: !Platform.isWindows);
+  }
+
+  testWidgets('Search reaches distant lazy blocks, wraps, and survives view switches', (tester) async {
+    final source = ['# 海岸', for (var i = 0; i < 220; i++) '第 $i 段正文', '**海岸**'].join('\n\n');
+    await startApp(tester, MarkdownApp(initialText: source));
+    final document = tester.widget<TextField>(find.byType(TextField)).controller!;
+    final preview = tester.widget<CustomScrollView>(find.byType(CustomScrollView)).controller!;
+    await tester.tap(find.byTooltip('更多'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('查找  Ctrl+F'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.widgetWithText(TextField, '查找内容'), '海岸');
+    await tester.pumpAndSettle();
+    expect(find.text('1/2'), findsOneWidget);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.pumpAndSettle();
+    expect(find.text('2/2'), findsOneWidget);
+    expect(preview.offset, greaterThan(1000));
+    expect(previewText('海岸').hitTestable(), findsWidgets);
+    await tester.tap(find.text('预览'));
+    await tester.pumpAndSettle();
+    expect(find.text('2/2'), findsOneWidget);
+    await tester.tap(find.text('编辑'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('下一个'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('分栏'));
+    await tester.pumpAndSettle();
+    expect(find.text('1/2'), findsOneWidget);
+    expect(preview.offset, 0);
+    expect(document.text, source);
+    await tester.tap(find.byTooltip('关闭查找'));
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(const SizedBox.shrink());
+  }, skip: !Platform.isWindows);
 
   testWidgets('New document previews edits and clears dirty state on restore',
       (tester) async {

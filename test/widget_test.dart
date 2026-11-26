@@ -197,6 +197,27 @@ void main() {
   }
 
   for (final brightness in Brightness.values) {
+    testWidgets('Theme menu toggles the displayed $brightness system theme', (tester) async {
+      tester.platformDispatcher.platformBrightnessTestValue = brightness;
+      addTearDown(tester.platformDispatcher.clearPlatformBrightnessTestValue);
+      await startApp(tester, const MarkdownApp());
+
+      Brightness displayed() => Theme.of(tester.element(find.byType(Scaffold))).brightness;
+      Future<void> toggle() async {
+        await tester.tap(find.byTooltip('更多'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('切换浅色／深色'));
+        await tester.pumpAndSettle();
+      }
+
+      expect(displayed(), brightness);
+      await toggle();
+      expect(displayed(), brightness == Brightness.dark ? Brightness.light : Brightness.dark);
+      await toggle();
+      expect(displayed(), brightness);
+      await tester.pumpWidget(const SizedBox.shrink());
+    }, skip: !Platform.isWindows);
+
     testWidgets('Find paints readable preview text and both chevrons in $brightness', (tester) async {
       tester.platformDispatcher.platformBrightnessTestValue = brightness;
       addTearDown(tester.platformDispatcher.clearPlatformBrightnessTestValue);

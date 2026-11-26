@@ -180,15 +180,16 @@ class _MarkdownAppState extends State<MarkdownApp> {
           colorSchemeSeed: Colors.blueGrey,
           fontFamily: Platform.isWindows ? 'Microsoft YaHei' : null,
         ),
-        home: EditorPage(
+        home: Builder(builder: (editorContext) => EditorPage(
           initialPath: widget.initialPath,
           initialVersion: widget.initialVersion,
           initialText: widget.initialText,
           startupError: widget.startupError,
           onThemeToggle: () => setState(() {
-            mode = mode == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
+            mode = Theme.of(editorContext).brightness == Brightness.dark
+                ? ThemeMode.light : ThemeMode.dark;
           }),
-        ),
+        )),
       );
 }
 

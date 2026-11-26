@@ -14,6 +14,22 @@
   #error Missing data\app.so in Release.
 #endif
 
+; Validate the staged bundle even when the compiler is launched directly.
+#define ReleaseFile(str Name) AddBackslash(SourcePath) + ReleaseDir + "\" + Name
+#define RequireFile(str Name) \
+  FileSize(ReleaseFile(Name)) > 0 ? 1 : Error("Missing or empty Release file: " + Name)
+#define RequireCopiedNotice(str Name) \
+  RequireFile(Name) && \
+  (GetSHA256OfFile(ReleaseFile(Name)) == GetSHA256OfFile(AddBackslash(SourcePath) + "..\" + Name) \
+    ? 1 : Error("Release notice differs from source: " + Name + ". Run Prepare-ReleaseNotices.ps1."))
+
+#expr RequireFile("data\flutter_assets\NOTICES.Z")
+#expr RequireCopiedNotice("THIRD_PARTY_NOTICES.md")
+#expr RequireCopiedNotice("licenses\FLUTTER_GENERATED_NOTICES.txt")
+#expr RequireCopiedNotice("licenses\fonts\JetBrainsMono-OFL.txt")
+#expr RequireCopiedNotice("licenses\fonts\LatinModern-GUST-FONT-LICENSE.txt")
+#expr RequireCopiedNotice("licenses\fonts\LPPL-1.3c.txt")
+
 [Setup]
 ; Keep this ID unchanged for future versions.
 AppId={{C38DF467-0783-4B25-B4BF-6E9B1EA242D0}

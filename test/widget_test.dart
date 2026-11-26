@@ -136,6 +136,71 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   }, skip: !Platform.isWindows);
 
+  for (final marker in ['~~~', '```']) {
+    testWidgets('Open $marker fence keeps literal math and link payload glyphs', (tester) async {
+      const body = r'Code $hit$ [hit](hit)';
+      await startApp(tester, MarkdownApp(initialText: '$marker\r\n$body'));
+      await tester.tap(find.byTooltip('更多'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('查找  Ctrl+F'));
+      await tester.pumpAndSettle();
+      final query = find.widgetWithText(TextField, '查找内容');
+      final paragraph = tester.renderObject<RenderParagraph>(find.descendant(
+        of: find.byType(SliverGptMarkdown),
+        matching: find.byWidgetPredicate((w) => w is RichText && w.text.toPlainText() == body),
+      ));
+      Future<void> checkBox(String needle, int index, int total) async {
+        expect(find.text('$index/$total'), findsOneWidget);
+        final painter = tester.widgetList<CustomPaint>(find.byType(CustomPaint))
+            .map((w) => w.foregroundPainter).whereType<PreviewFindPainter>().single;
+        final at = needle.allMatches(body).elementAt(index - 1).start;
+        final expected = paragraph.getBoxesForSelection(
+            TextSelection(baseOffset: at, extentOffset: at + needle.length)).first.toRect();
+        final viewport = painter.viewportKey.currentContext!.findRenderObject()!;
+        final rect = MatrixUtils.transformRect(paragraph.getTransformTo(viewport), expected);
+        expect(painter.currentGlyphBox(), rect);
+      }
+      await tester.enterText(query, 'hit');
+      await tester.pumpAndSettle();
+      for (var i = 1; i <= 3; i++) {
+        await checkBox('hit', i, 3);
+        await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+        await tester.pumpAndSettle();
+      }
+      await tester.enterText(query, 'Code');
+      await tester.pumpAndSettle();
+      await checkBox('Code', 1, 1); // The renderer also inserts a "Code" header.
+      await tester.pumpWidget(const SizedBox.shrink());
+    }, skip: !Platform.isWindows);
+  }
+
+  testWidgets('Ambiguous rendered text reveals its source row without a false highlight', (tester) async {
+    final source = [for (var i = 0; i < 100; i++) '段落 $i', '尾段 &amp; amp'].join('\n\n');
+    await startApp(tester, MarkdownApp(initialText: source));
+    await tester.tap(find.byTooltip('更多'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('查找  Ctrl+F'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.widgetWithText(TextField, '查找内容'), 'amp');
+    await tester.pumpAndSettle();
+    final painter = tester.widgetList<CustomPaint>(find.byType(CustomPaint))
+        .map((w) => w.foregroundPainter).whereType<PreviewFindPainter>().single;
+    expect(find.text('1/2'), findsOneWidget);
+    expect(painter.scroll.offset, greaterThan(0));
+    expect(previewText('尾段 & amp').hitTestable(), findsWidgets);
+    expect(painter.currentGlyphBox(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  }, skip: !Platform.isWindows);
+
+  test('Escaped closing bracket does not expose a repeated link destination', () {
+    const text = r'[same\]](same) same';
+    final map = PreviewFindMap(text);
+    final find = DocumentFind()..update(text, 'same', true);
+    expect(find.hits.map((h) => h.start), [1, 9, 15]);
+    expect(map.blocks.single.visibleSource.substring(9, 13), '\x00' * 4);
+    expect(map.rowFor(9), 0);
+  });
+
   test('Typing, replacement, and later typing have distinct history boundaries', () {
     final doc = TextEditingController(text: '甲');
     final history = DocumentHistory(doc);

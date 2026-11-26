@@ -10,7 +10,8 @@ import 'document_find.dart';
 /// Mirrors the lazy preview's segment order, including its omission of
 /// definition-only rows. Keep the original UTF-16 coordinates across CRLF.
 class PreviewFindMap {
-  final blocks = <({int start, int end, String visibleSource})>[];
+  final blocks =
+      <({int start, int end, String visibleSource, TextRange? codeBody})>[];
   final rawOffsets = <int>[];
 
   PreviewFindMap(String source) {
@@ -36,16 +37,21 @@ class PreviewFindMap {
       offset = start + segment.length;
       final raw = text.substring(start, offset);
       final left = raw.trimLeft();
-      if ((left.startsWith('[') || left.startsWith('<')) &&
-          Plusparse.parse(raw, definitions: defs, useDollarSignsForLatex: true)
-              .children
-              .isEmpty) {
+      if (((left.startsWith('[') && raw.contains(']:')) ||
+              left.startsWith('<')) &&
+          Plusparse.parse(
+            raw,
+            definitions: defs,
+            useDollarSignsForLatex: true,
+          ).children.isEmpty) {
         continue;
       }
+      final codeBody = _fencedBody(raw);
       blocks.add((
         start: start,
         end: offset,
-        visibleSource: _visibleSource(raw, defs)
+        visibleSource: codeBody == null ? _visibleSource(raw, defs) : raw,
+        codeBody: codeBody,
       ));
     }
   }
@@ -114,43 +120,72 @@ class PreviewFindMap {
     return String.fromCharCodes(units);
   }
 
+  // CodeField renders the literal body in one paragraph. Its toolbar can
+  // also render synthetic text (e.g. "Code"). Do not align that with code.
+  // null means normal inline mapping; an invalid range means row-only.
+  static TextRange? _fencedBody(String text) {
+    if (!text.contains('~~~') && !text.contains('```')) return null;
+    syntax.FenceOpen? fence;
+    var bodyStart = 0;
+    var offset = 0;
+    for (final line in text.split('\n')) {
+      final end = offset + line.length;
+      if (fence == null) {
+        final opening = syntax.fenceOpen(syntax.unquoted(line));
+        if (opening != null) {
+          // Mixed/nested blocks may strip indentation and quote prefixes.
+          if (offset != 0 ||
+              line != line.trimLeft() ||
+              syntax.quoteDepth(line) != 0) {
+            return TextRange.empty;
+          }
+          fence = opening;
+          bodyStart = math.min(end + 1, text.length);
+        }
+      } else if (syntax.indentWidth(line) <= 3 &&
+          syntax.isFenceClose(line, fence)) {
+        if (end != text.length) return TextRange.empty;
+        return TextRange(
+          start: bodyStart,
+          end: math.max(bodyStart, offset - 1),
+        );
+      }
+      offset = end + 1;
+    }
+    return fence == null ? null : TextRange(start: bodyStart, end: text.length);
+  }
+
   // Never align a repeated label/prose word with an invisible URL, title,
   // image description, or reference ID. Leave code spans/fences literal.
   static String _visibleSource(String text, MarkdownDefinitions defs) {
     final units = text.codeUnits.toList();
     // ATX heading/blockquote prefixes and list markers have no glyphs.
-    // Keep fenced payloads untouched, including lines beginning with "# ".
+    // Fences have their own literal mapping in _row.
     final prefixes = RegExp(
-        r'^[ \t]*(?:(?:>[ \t]*)+|#{1,6}[ \t]+|[-*+][ \t]+(?:\[[ xX]\][ \t]+)?)');
-    final fence = RegExp(r'^\s*(`{3,}|~{3,})');
-    String? delimiter;
+      r'^[ \t]*(?:(?:>[ \t]*)+|#{1,6}[ \t]+|[-*+][ \t]+(?:\[[ xX]\][ \t]+)?)',
+    );
     var lineOffset = 0;
     for (final line in text.split('\n')) {
-      final marker = fence.firstMatch(line)?.group(1);
-      if (delimiter != null) {
-        if (marker != null &&
-            marker.startsWith(delimiter) &&
-            line.trim() == marker) {
-          delimiter = null;
-        }
-      } else if (marker != null) {
-        delimiter = marker;
-      } else {
-        final prefix = prefixes.firstMatch(line);
-        if (prefix != null) {
-          units.fillRange(lineOffset, lineOffset + prefix.end, 0);
-        }
+      final prefix = prefixes.firstMatch(line);
+      if (prefix != null) {
+        units.fillRange(lineOffset, lineOffset + prefix.end, 0);
       }
       lineOffset += line.length + 1;
     }
+    late final ends = _pairedEnds(text);
+    var parsedThrough = 0;
     final dollars = syntax.DollarMathCloser(text);
+    final missingClosers = <String>{};
     var i = 0;
     void mask(int start, int end) {
       units.fillRange(start, end, 0);
     }
 
     while (i < text.length) {
-      if (units[i] == 0) { i++; continue; }
+      if (units[i] == 0) {
+        i++;
+        continue;
+      }
       final c = text[i];
       // Equation renderers draw mathematical glyphs; the TeX source has
       // no literal text geometry. Keep later identical prose unambiguous.
@@ -159,8 +194,12 @@ class PreviewFindMap {
       if (text.startsWith(r'\[', i)) mathEnd = r'\]';
       if (text.startsWith(r'$$', i)) mathEnd = r'$$';
       if (mathEnd != null) {
-        final end = text.indexOf(mathEnd, i + 2);
-        if (end >= 0) {
+        final end = missingClosers.contains(mathEnd)
+            ? -1
+            : text.indexOf(mathEnd, i + 2);
+        if (end < 0) missingClosers.add(mathEnd);
+        if (end >= 0 &&
+            (c == r'$' || syntax.isMathBody(text.substring(i + 2, end)))) {
           mask(i, end + 2);
           i = end + 2;
           continue;
@@ -173,34 +212,47 @@ class PreviewFindMap {
           continue;
         }
       }
-      if (c == '\\') {
+      if (c == '\\' &&
+          i + 1 < text.length &&
+          syntax.isAsciiPunctuation(text.codeUnitAt(i + 1))) {
+        mask(i, i + 1);
         i += 2;
         continue;
       }
-      if (c == '\x60' || (c == '~' && text.startsWith('~~~', i))) {
-        var end = i + 1;
-        while (end < text.length && text[end] == c) {
-          end++;
+      if (c == '\x60') {
+        final span = syntax.codeSpanAt(text, i);
+        if (span == null) {
+          i += syntax.backtickRunAt(text, i);
+        } else {
+          mask(i, i + span.run);
+          mask(span.close, span.close + span.run);
+          i = span.close + span.run;
         }
-        final close = text.indexOf(text.substring(i, end), end);
-        i = close < 0 ? end : close + end - i;
         continue;
       }
       final image = text.startsWith('![', i);
       if (image || c == '[') {
         final label = image ? i + 1 : i;
-        final labelEnd = balancedEnd(text, label, '[', ']');
+        final labelEnd = ends[label];
         if (labelEnd != null) {
           var end = labelEnd;
-          if (end < text.length && text[end] == '(') {
-            end = balancedEnd(text, end, '(', ')') ?? end;
-          } else if (end < text.length && text[end] == '[') {
-            end = balancedEnd(text, end, '[', ']') ?? end;
+          if (end < text.length && (text[end] == '(' || text[end] == '[')) {
+            end = ends[end] ?? end;
           }
+          if (end == labelEnd && defs.isEmpty) {
+            i++;
+            continue;
+          }
+          // Don't reparse overlapping link candidates. Rendering nested
+          // constructs without source spans cannot establish their ownership.
+          if (i < parsedThrough) return '';
+          parsedThrough = end;
           // Ask the same parser whether this is a real link. Unresolved
           // references and unmatched delimiters remain visible literally.
-          final parsed =
-              Plusparse.parse(text.substring(i, end), definitions: defs);
+          final parsed = Plusparse.parse(
+            text.substring(i, end),
+            definitions: defs,
+          );
           final paragraph = parsed.children.firstOrNull;
           final node =
               paragraph is MdParagraph && paragraph.children.length == 1
@@ -228,19 +280,24 @@ class PreviewFindMap {
     return String.fromCharCodes(units);
   }
 
-  static int? balancedEnd(String text, int start, String open, String close) {
-    var depth = 1;
-    for (var i = start + 1; i < text.length; i++) {
-      final ch = text[i];
-      if (ch == '\\\\') {
-        i++;
-      } else if (ch == open) {
-        depth++;
-      } else if (ch == close && --depth == 0) {
-        return i + 1;
+  static Map<int, int> _pairedEnds(String text) {
+    final ends = <int, int>{};
+    final brackets = <int>[], parentheses = <int>[];
+    for (var i = 0; i < text.length; i++) {
+      switch (text.codeUnitAt(i)) {
+        case 0x5c: // Backslash escapes the next delimiter.
+          i++;
+        case 0x5b: // [
+          brackets.add(i);
+        case 0x5d: // ]
+          if (brackets.isNotEmpty) ends[brackets.removeLast()] = i + 1;
+        case 0x28: // (
+          parentheses.add(i);
+        case 0x29: // )
+          if (parentheses.isNotEmpty) ends[parentheses.removeLast()] = i + 1;
       }
     }
-    return null;
+    return ends;
   }
 
   // Map a source boundary to this rendered run without rescanning a long
@@ -303,9 +360,75 @@ class PreviewFindPainter extends CustomPainter {
       return null;
     }
     final source = block.visibleSource;
-    var cursor = 0;
     Rect? active;
+    void highlight(RenderParagraph paragraph, int base, int glyph, int length) {
+      var n = find.firstEndingAfter(map.rawOffsets[base]);
+      while (n < find.hits.length &&
+          find.hits[n].start < map.rawOffsets[base + length]) {
+        final hit = find.hits[n];
+        final selection = TextSelection(
+          baseOffset: glyph + map.localOffset(hit.start, base, length),
+          extentOffset: glyph + map.localOffset(hit.end, base, length),
+        );
+        for (final box in paragraph.getBoxesForSelection(selection)) {
+          final rect = MatrixUtils.transformRect(
+            paragraph.getTransformTo(viewport),
+            box.toRect(),
+          );
+          // Blend the foreground overlay without obscuring the glyph ink.
+          final brightness = colors.brightness;
+          canvas?.drawRect(
+            rect,
+            Paint()
+              ..color = Color.alphaBlend(
+                findHighlight(n == find.index, brightness),
+                colors.surface,
+              )
+              ..blendMode = brightness == Brightness.light
+                  ? BlendMode.darken
+                  : BlendMode.lighten,
+          );
+          if (n == find.index) active ??= rect;
+        }
+        n++;
+      }
+    }
+
+    final body = block.codeBody;
+    if (body != null) {
+      if (!body.isValid || body.isCollapsed) return null;
+      final literal = body.textInside(source);
+      RenderParagraph? paragraph;
+      var ambiguous = false;
+      void locate(RenderObject object) {
+        if (object is RenderParagraph &&
+            object.text.toPlainText(includeSemanticsLabels: false) == literal) {
+          if (paragraph != null) ambiguous = true;
+          paragraph = object;
+        }
+        object.visitChildren(locate);
+      }
+
+      locate(row);
+      if (paragraph != null && !ambiguous) {
+        highlight(paragraph!, block.start + body.start, 0, literal.length);
+      }
+      return active;
+    }
+
+    // A later mismatch can invalidate an earlier occurrence of repeated text.
+    // Validate the entire row before drawing any candidate boxes.
+    final runs =
+        <({RenderParagraph paragraph, int base, int glyph, int length})>[];
+    final skippedMarks = <int>{};
+    final renderedMarks = <int>{};
+    bool emphasis(int unit) => unit == 42 || unit == 95 || unit == 126;
+    bool skippable(int unit) =>
+        unit == 0 || syntax.isUnicodeWhitespace(unit) || emphasis(unit);
+    var cursor = 0;
+    var aligned = true;
     void visit(RenderObject object) {
+      if (!aligned) return;
       if (object is! RenderParagraph) {
         object.visitChildren(visit);
         return;
@@ -315,6 +438,7 @@ class PreviewFindPainter extends CustomPainter {
       var childIndex = 0;
       var glyph = 0;
       object.text.visitChildren((span) {
+        if (!aligned) return false;
         if (span is PlaceholderSpan) {
           if (childIndex < inlineChildren.length) {
             visit(inlineChildren[childIndex++]);
@@ -322,34 +446,42 @@ class PreviewFindPainter extends CustomPainter {
           glyph++;
         } else if (span is TextSpan && span.text != null) {
           final run = span.text!;
-          for (final token in RegExp(r'\S+|\s+').allMatches(run)) {
-            final word = token[0]!;
-            final start = source.indexOf(word, cursor);
-            if (start < 0 || (word.trim().isEmpty && start != cursor)) continue;
-            cursor = start + word.length;
-            final base = block.start + start;
-            var n = find.firstEndingAfter(map.rawOffsets[base]);
-            while (n < find.hits.length &&
-                find.hits[n].start < map.rawOffsets[base + word.length]) {
-              final hit = find.hits[n];
-              final a = map.localOffset(hit.start, base, word.length);
-              final b = map.localOffset(hit.end, base, word.length);
-              for (final box in object.getBoxesForSelection(TextSelection(
-                  baseOffset: glyph + token.start + a,
-                  extentOffset: glyph + token.start + b))) {
-                final rect = MatrixUtils.transformRect(
-                    object.getTransformTo(viewport), box.toRect());
-                // A viewport underlay disappears behind code/table surfaces.
-                // Darken only the lighter pixels (light theme), or lighten
-                // only the darker ones (dark theme), preserving text contrast.
-                final brightness = colors.brightness;
-                canvas?.drawRect(rect, Paint()
-                  ..color = Color.alphaBlend(findHighlight(n == find.index, brightness), colors.surface)
-                  ..blendMode = brightness == Brightness.light ? BlendMode.darken : BlendMode.lighten);
-                if (n == find.index) active ??= rect;
-              }
-              n++;
+          var j = 0;
+          while (j < run.length) {
+            final unit = run.codeUnitAt(j);
+            // Only step past masked syntax, whitespace and emphasis marks.
+            // A rendered substitution must not steal the next identical word.
+            while (
+                cursor < source.length && source.codeUnitAt(cursor) != unit) {
+              final skipped = source.codeUnitAt(cursor);
+              if (!skippable(skipped)) break;
+              if (emphasis(skipped)) skippedMarks.add(skipped);
+              cursor++;
             }
+            final start = cursor;
+            while (j < run.length &&
+                cursor < source.length &&
+                source.codeUnitAt(cursor) == run.codeUnitAt(j)) {
+              final matched = run.codeUnitAt(j);
+              if (emphasis(matched)) renderedMarks.add(matched);
+              j++;
+              cursor++;
+            }
+            if (cursor == start) {
+              if (syntax.isUnicodeWhitespace(unit)) {
+                j++;
+                continue;
+              }
+              aligned = false;
+              return false;
+            }
+            final length = cursor - start;
+            runs.add((
+              paragraph: object,
+              base: block.start + start,
+              glyph: glyph + j - length,
+              length: length,
+            ));
           }
           glyph += run.length;
         }
@@ -358,6 +490,16 @@ class PreviewFindPainter extends CustomPainter {
     }
 
     visit(row);
+    if (!aligned) return null;
+    for (; cursor < source.length; cursor++) {
+      final unit = source.codeUnitAt(cursor);
+      if (!skippable(unit)) return null;
+      if (emphasis(unit)) skippedMarks.add(unit);
+    }
+    if (skippedMarks.any(renderedMarks.contains)) return null;
+    for (final run in runs) {
+      highlight(run.paragraph, run.base, run.glyph, run.length);
+    }
     return active;
   }
 

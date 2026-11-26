@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' as ui;
@@ -7,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
+import 'package:window_manager/window_manager.dart';
 import 'package:markdown_reader/main.dart';
 import 'package:markdown_reader/find_preview.dart';
 import 'package:markdown_reader/document_find.dart';
@@ -331,19 +333,118 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   }, skip: !Platform.isWindows);
 
+  for (final outcome in ['cancel', 'conflict', 'recovery', 'edit during save', 'overwrite']) {
+    testWidgets('Save As preserves editor state: $outcome', (tester) async {
+      const original = r'C:\docs\old.md';
+      const selected = r'C:\docs\new.md';
+      const channel = MethodChannel('h2readmd/storage');
+      final reply = Completer<Object?>();
+      final calls = <MethodCall>[];
+      final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        calls.add(call);
+        return reply.future;
+      });
+      addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+      await startApp(tester, const MarkdownApp(initialPath: original, initialVersion: 'old'));
+      await tester.enterText(find.byType(TextField), 'first');
+      await tester.tap(find.byTooltip('更多'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('另存为'));
+      await tester.pumpAndSettle();
+      expect(calls.single.method, 'saveAs');
+      expect((calls.single.arguments as Map)['version'], 'old');
+      if (outcome == 'edit during save') await tester.enterText(find.byType(TextField), 'second');
+      switch (outcome) {
+        case 'cancel': reply.complete(null);
+        case 'conflict': reply.completeError(PlatformException(code: 'save_failed', message: '磁盘文件已被修改'));
+        case 'recovery': reply.completeError(PlatformException(code: 'recovery', message: '请检查 previous.md'));
+        default: reply.complete({'path': selected, 'version': 'next'});
+      }
+      await tester.pumpAndSettle();
+      if (outcome == 'recovery') {
+        expect(find.text('请核对磁盘文件'), findsOneWidget);
+        await tester.tap(find.text('知道了'));
+        await tester.pumpAndSettle();
+      }
+      expect(tester.widget<TextField>(find.byType(TextField)).controller!.text,
+          outcome == 'edit during save' ? 'second' : 'first');
+      expect(nativeTitles.last, switch (outcome) {
+        'edit during save' => '*new.md - H2 Readmd',
+        'overwrite' => 'new.md - H2 Readmd',
+        _ => '*old.md - H2 Readmd',
+      });
+      await tester.pumpWidget(const SizedBox.shrink());
+    }, skip: !Platform.isWindows);
+  }
+
+  for (final outcome in ['saved', 'failure', 'edited']) {
+    testWidgets('Close rechecks snapshot after save: $outcome', (tester) async {
+      final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      final reply = Completer<Object?>();
+      const storage = MethodChannel('h2readmd/storage');
+      final saves = <String>[];
+      messenger.setMockMethodCallHandler(storage, (call) async {
+        saves.add(call.method);
+        return reply.future;
+      });
+      addTearDown(() => messenger.setMockMethodCallHandler(storage, null));
+      const path = r'C:\docs\close.md';
+      await startApp(tester, const MarkdownApp(initialPath: path, initialVersion: 'opened'));
+      final controller = tester.widget<TextField>(find.byType(TextField)).controller!;
+      controller.text = 'draft';
+      await tester.pumpAndSettle();
+      final methods = <String>[];
+      messenger.setMockMethodCallHandler(windowChannel, (call) async {
+        methods.add(call.method);
+        return null;
+      });
+      (tester.state(find.byType(EditorPage)) as WindowListener).onWindowClose();
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, '保存'));
+      await tester.pumpAndSettle();
+      expect(saves, ['save']);
+      if (outcome == 'edited') controller.text = 'newer draft';
+      if (outcome == 'failure') {
+        reply.completeError(PlatformException(code: 'save_failed', message: '只读文件'));
+      } else {
+        reply.complete({'path': path, 'version': 'saved'});
+      }
+      await tester.pumpAndSettle();
+      expect(methods.contains('close'), outcome == 'saved');
+      expect(methods.contains('setPreventClose'), outcome == 'saved');
+      expect(controller.text, outcome == 'edited' ? 'newer draft' : 'draft');
+      await tester.pumpWidget(const SizedBox.shrink());
+    }, skip: !Platform.isWindows);
+  }
+
+  testWidgets('A clean buffer becomes unsaved when its disk baseline is lost', (tester) async {
+    const channel = MethodChannel('h2readmd/storage');
+    final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(channel, (_) async {
+      throw PlatformException(code: 'document_conflict', message: '原路径不存在');
+    });
+    addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+    await startApp(tester, const MarkdownApp(initialPath: r'C:\docs\lost.md', initialVersion: 'old'));
+    await tester.tap(find.byTooltip('保存'));
+    await tester.pumpAndSettle();
+    expect(nativeTitles.last, '*lost.md - H2 Readmd');
+    await tester.pumpWidget(const SizedBox.shrink());
+  }, skip: !Platform.isWindows);
+
   for (final newDocument in [false, true]) {
     testWidgets('Ctrl+S saves ${newDocument ? "new" : "opened"} document with editor focus',
         (tester) async {
       const path = r'C:\Documents\中文 文档.md';
       final calls = <MethodCall>[];
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(const MethodChannel('filegate'), (call) async {
+          .setMockMethodCallHandler(const MethodChannel('h2readmd/storage'), (call) async {
         calls.add(call);
-        return {'path': path, 'name': '中文 文档.md', 'kind': 'file'};
+        return {'path': path, 'version': 'saved-${calls.length}'};
       });
       addTearDown(() => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(const MethodChannel('filegate'), null));
-      await startApp(tester, MarkdownApp(initialPath: newDocument ? null : path));
+          .setMockMethodCallHandler(const MethodChannel('h2readmd/storage'), null));
+      await startApp(tester, MarkdownApp(initialPath: newDocument ? null : path, initialVersion: newDocument ? null : 'opened'));
       for (final text in ['首次保存', '再次保存']) {
         await tester.enterText(find.byType(TextField), text);
         await tester.pumpAndSettle();
@@ -355,10 +456,11 @@ void main() {
         await tester.pumpAndSettle();
         expect(calls.length, text == '首次保存' ? 1 : 2);
         final call = calls.last;
-        expect(call.method, newDocument && calls.length == 1 ? 'save' : 'write');
+        expect(call.method, newDocument && calls.length == 1 ? 'saveAs' : 'save');
         final arguments = call.arguments as Map;
         expect(utf8.decode(arguments['bytes'] as List<int>), text);
-        if (call.method == 'write') expect(arguments['path'], path);
+        expect(arguments['path'], newDocument && calls.length == 1 ? '' : path);
+        expect(arguments['version'], calls.length == 2 ? 'saved-1' : newDocument ? '' : 'opened');
         expect(nativeTitles.last, '中文 文档.md - H2 Readmd');
         expect(tester.takeException(), isNull);
       }

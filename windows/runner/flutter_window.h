@@ -9,6 +9,7 @@
 #include <flutter/encodable_value.h>
 
 #include "win32_window.h"
+#include "storage_channel.h"
 
 // A window that does nothing but host a Flutter view.
 class FlutterWindow : public Win32Window {
@@ -26,6 +27,8 @@ class FlutterWindow : public Win32Window {
 
  private:
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> input_channel_;
+
+  std::unique_ptr<StorageChannel> storage_channel_;
 
   // The project to run.
   flutter::DartProject project_;

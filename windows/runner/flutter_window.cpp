@@ -159,6 +159,7 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  storage_channel_ = std::make_unique<StorageChannel>(flutter_controller_->engine()->messenger(), GetHandle());
   input_channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
       flutter_controller_->engine()->messenger(), "h2readmd/desktop_input",
       &flutter::StandardMethodCodec::GetInstance());
@@ -218,6 +219,7 @@ void FlutterWindow::OnDestroy() {
   if (flutter_controller_) {
     RemoveWindowSubclass(flutter_controller_->view()->GetNativeWindow(), InputSubclass, 1);
     input_states.erase(flutter_controller_->view()->GetNativeWindow());
+    storage_channel_.reset();
     input_channel_.reset();
     flutter_controller_ = nullptr;
   }
@@ -234,6 +236,10 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     TraceClose("native SC_CLOSE received");
   }
   if (message == WM_CLOSE) TraceClose("native WM_CLOSE received");
+  if (message == StorageChannel::kCompleted && storage_channel_) {
+    storage_channel_->Complete();
+    return 0;
+  }
   if (message == WM_DESTROY) TraceClose("native WM_DESTROY received");
   if (message == WM_NCDESTROY) TraceClose("native WM_NCDESTROY received");
   // Give Flutter, including plugins, an opportunity to handle window messages.

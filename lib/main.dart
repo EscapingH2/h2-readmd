@@ -116,10 +116,13 @@ const _windowsBodyStyle = TextStyle(
   letterSpacing: 0,
 );
 
+const _storage = MethodChannel('h2readmd/storage');
+
 Future<void> main(List<String> arguments) async {
   WidgetsFlutterBinding.ensureInitialized();
   String? initialPath;
   String initialText = '';
+  String? initialVersion;
   String? startupError;
   if (Platform.isWindows) {
     await _loadWindowsReadingFont();
@@ -130,7 +133,9 @@ Future<void> main(List<String> arguments) async {
       try {
         final path = parseStartupFilePath(arguments)!;
         final file = File(path).absolute;
-        initialText = await file.readAsString(encoding: utf8);
+        final opened = (await _storage.invokeMapMethod<String, dynamic>('read', {'path': file.path}))!;
+        initialText = utf8.decode(opened['bytes'] as Uint8List);
+        initialVersion = opened['version'] as String;
         initialPath = file.path;
       } catch (error) {
         startupError = '无法打开文档：$error';
@@ -140,12 +145,14 @@ Future<void> main(List<String> arguments) async {
   runApp(MarkdownApp(
     initialPath: initialPath,
     initialText: initialText,
+    initialVersion: initialVersion,
     startupError: startupError,
   ));
 }
 
 class MarkdownApp extends StatefulWidget {
-  const MarkdownApp({super.key, this.initialPath, this.initialText = '', this.startupError});
+  const MarkdownApp({super.key, this.initialPath, this.initialVersion, this.initialText = '', this.startupError});
+  final String? initialVersion;
   final String? initialPath;
   final String initialText;
   final String? startupError;
@@ -175,6 +182,7 @@ class _MarkdownAppState extends State<MarkdownApp> {
         ),
         home: EditorPage(
           initialPath: widget.initialPath,
+          initialVersion: widget.initialVersion,
           initialText: widget.initialText,
           startupError: widget.startupError,
           onThemeToggle: () => setState(() {
@@ -187,7 +195,8 @@ class _MarkdownAppState extends State<MarkdownApp> {
 enum ViewMode { both, editor, preview }
 
 class EditorPage extends StatefulWidget {
-  const EditorPage({super.key, required this.onThemeToggle, this.initialPath, this.initialText = '', this.startupError});
+  const EditorPage({super.key, required this.onThemeToggle, this.initialPath, this.initialVersion, this.initialText = '', this.startupError});
+  final String? initialVersion;
   final VoidCallback onThemeToggle;
   final String? initialPath;
   final String initialText;
@@ -408,6 +417,8 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   double? _editorLayoutWidth;
   double? _previewLayoutWidth;
   String? _path;
+  String? _diskVersion;
+  bool _unconfirmedSave = false;
   String _name = 'Untitled.md';
   String _savedText = '';
   ViewMode _view = ViewMode.both;
@@ -419,13 +430,14 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   String? _lastNativeTitle;
   bool _syncingTitle = false;
 
-  bool get _dirty => _controller.text != _savedText;
+  bool get _dirty => _unconfirmedSave || _controller.text != _savedText;
   String get _documentLabel => '${_dirty ? '*' : ''}$_name';
 
   @override
   void initState() {
     super.initState();
     _path = widget.initialPath;
+    _diskVersion = widget.initialVersion;
     if (_path != null) _name = File(_path!).uri.pathSegments.last;
     _savedText = widget.initialText;
     _controller.text = widget.initialText;
@@ -562,6 +574,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   }
 
   Future<bool> _canLeave() async {
+    if (_busy) return false;
     if (!_dirty) return true;
     final answer = await showDialog<String>(
       context: context,
@@ -661,7 +674,21 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     try {
       final content = _controller.text;
       final bytes = Uint8List.fromList(utf8.encode(content));
-      if (_path == null || saveAs) {
+      String? warning;
+      if (Platform.isWindows) {
+        final saved = await _storage.invokeMapMethod<String, dynamic>(
+          _path == null || saveAs ? 'saveAs' : 'save',
+          {'bytes': bytes, 'name': _name, 'path': _path ?? '', 'version': _diskVersion ?? ''},
+        );
+        if (saved == null || !mounted) return false;
+        final path = saved['path'] as String;
+        final version = saved['version'] as String;
+        warning = saved['warning'] as String?;
+        _path = path;
+        _name = File(path).uri.pathSegments.last;
+        _diskVersion = version;
+        _unconfirmedSave = false;
+      } else if (_path == null || saveAs) {
         final saved = await _files.saveFile(
           bytes,
           suggestedName: _name,
@@ -677,8 +704,23 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
       if (!mounted) return true;
       setState(() => _savedText = content);
       _syncWindowTitle();
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已保存')));
+      if (warning != null && warning.isNotEmpty) {
+        await _saveNotice('保存完成，需要检查备份目录', warning);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已保存')));
+      }
       return true;
+    } on PlatformException catch (error) {
+      if (mounted && (error.code == 'recovery' || error.code == 'document_conflict')) {
+        setState(() => _unconfirmedSave = true);
+        _syncWindowTitle();
+      }
+      if (error.code == 'recovery' && mounted) {
+        await _saveNotice('请核对磁盘文件', error.message ?? '无法核实保存结果，请另存为新文件。');
+      } else {
+        _error(error.message ?? error.code);
+      }
+      return false;
     } catch (error) {
       _error(error);
       return false;
@@ -686,6 +728,16 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
       if (mounted) setState(() => _busy = false);
     }
   }
+
+  Future<void> _saveNotice(String title, String message) => showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (context) => AlertDialog(
+      title: Text(title),
+      content: SingleChildScrollView(child: SelectableText(message)),
+      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('知道了'))],
+    ),
+  );
 
   Future<void> _paste() async {
     final data = await Clipboard.getData(Clipboard.kTextPlain);

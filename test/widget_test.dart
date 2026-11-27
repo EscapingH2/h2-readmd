@@ -500,6 +500,38 @@ void main() {
     }, skip: !Platform.isWindows);
   }
 
+  testWidgets('Evicting the opening snapshot preserves the dirty title and close check', (tester) async {
+    await startApp(tester, const MarkdownApp(
+      initialPath: r'C:\docs\budget.md', initialText: 'saved', initialVersion: 'opened',
+    ));
+    final field = tester.widget<TextField>(find.byType(TextField));
+    final doc = field.controller!;
+    doc.text = 'retained';
+    await tester.pump(const Duration(milliseconds: 501));
+    // Cross the production budget, then shrink the same typing group before layout.
+    doc.text = 'a' * (32 * 1024 * 1024);
+    doc.text = 'draft';
+    field.focusNode!.requestFocus();
+    await tester.pumpAndSettle();
+    for (var i = 0; i < 2; i++) {
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyZ);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pumpAndSettle();
+      expect(doc.text, 'retained');
+    }
+    expect(nativeTitles.last, '*budget.md - H2 Readmd');
+    (tester.state(find.byType(EditorPage)) as WindowListener).onWindowClose();
+    await tester.pumpAndSettle();
+    expect(find.text('有未保存的修改'), findsOneWidget);
+    await tester.tap(find.text('取消'));
+    await tester.pumpAndSettle();
+    doc.text = 'saved';
+    await tester.pumpAndSettle();
+    expect(nativeTitles.last, 'budget.md - H2 Readmd');
+    await tester.pumpWidget(const SizedBox.shrink());
+  }, skip: !Platform.isWindows);
+
   for (final outcome in ['saved', 'failure', 'edited']) {
     testWidgets('Close rechecks snapshot after save: $outcome', (tester) async {
       final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;

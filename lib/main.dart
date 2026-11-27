@@ -345,11 +345,13 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   bool _imeGeometryQueued = false;
   static const _desktopInput = MethodChannel('h2readmd/desktop_input');
 
-  void _inputTrace(String message) {
-    if (Platform.isWindows && Platform.environment['H2READMD_INPUT_TRACE'] == '1') {
-      unawaited(_desktopInput.invokeMethod<void>('trace', message)
-          .catchError((Object error) { debugPrint('Input trace unavailable: $error'); }));
-    }
+  static final _inputTraceEnabled =
+      Platform.isWindows && Platform.environment['H2READMD_INPUT_TRACE'] == '1';
+
+  void _inputTrace(String Function() message) {
+    if (!_inputTraceEnabled) return;
+    unawaited(_desktopInput.invokeMethod<void>('trace', message())
+        .catchError((Object error) { debugPrint('Input trace unavailable: $error'); }));
   }
 
   EditableTextState? _editableState([GlobalKey? fieldKey]) {
@@ -370,7 +372,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
 
 
   void _trackImeGeometry() {
-    _inputTrace('Dart geometry requested focus=${_editorFocus.hasFocus} queued=$_imeGeometryQueued selection=${_controller.selection.baseOffset},${_controller.selection.extentOffset} composing=${_controller.value.composing.start},${_controller.value.composing.end}');
+    _inputTrace(() => 'Dart geometry requested focus=${_editorFocus.hasFocus} queued=$_imeGeometryQueued selection=${_controller.selection.baseOffset},${_controller.selection.extentOffset} composing=${_controller.value.composing.start},${_controller.value.composing.end}');
     if (Platform.isWindows && !_fieldFocused) {
       unawaited(_desktopInput.invokeMethod<void>('caretInactive')
           .catchError((Object error) { debugPrint('IME caret reset failed: $error'); }));
@@ -389,7 +391,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
           TextPosition(offset: selection.extentOffset));
         final point = render.localToGlobal(rect.bottomLeft);
         final scale = View.of(state.context).devicePixelRatio;
-        _inputTrace('Dart caret x=${point.dx} y=${point.dy} scale=$scale');
+        _inputTrace(() => 'Dart caret x=${point.dx} y=${point.dy} scale=$scale');
         unawaited(_desktopInput.invokeMethod<void>('caret',
             <double>[point.dx * scale, point.dy * scale])
             .catchError((Object error) { debugPrint('IME native caret failed: $error'); }));
@@ -452,10 +454,10 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     _editorScrollController.addListener(_trackImeGeometry);
     if (Platform.isWindows) {
       _desktopInput.setMethodCallHandler((call) async {
-        _inputTrace('Dart native request=${call.method} focus=${_editorFocus.hasFocus} view=$_view');
+        _inputTrace(() => 'Dart native request=${call.method} focus=${_editorFocus.hasFocus} view=$_view');
         if (call.method == 'paste' && mounted && _fieldFocused && !_handlingExit && !_exitCommitted) {
           await _editableState(_activeFieldKey)?.pasteText(SelectionChangedCause.keyboard);
-          _inputTrace('Dart paste completed');
+          _inputTrace(() => 'Dart paste completed');
         }
       });
     }

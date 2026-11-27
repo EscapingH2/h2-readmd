@@ -21,6 +21,14 @@ std::map<HWND, InputState> input_states;
 
 void InputTrace(const char* stage);
 
+bool InputTraceEnabled() {
+  static const bool enabled = [] {
+    wchar_t value[2]{};
+    return GetEnvironmentVariableW(L"H2READMD_INPUT_TRACE", value, 2) == 1 && value[0] == L'1';
+  }();
+  return enabled;
+}
+
 void RefreshSystemCaret(HWND hwnd) {
   auto found = input_states.find(hwnd);
   if (found == input_states.end() || !found->second.has_caret || GetFocus() != hwnd) return;
@@ -46,25 +54,24 @@ void RefreshSystemCaret(HWND hwnd) {
     candidate.rcArea = {point.x, point.y - 1, point.x + 1, point.y};
     const BOOL candidate_ok = ImmSetCandidateWindow(context, &candidate);
     CANDIDATEFORM actual{};
-    const BOOL read_ok = ImmGetCandidateWindow(context, 0, &actual);
+    const bool trace = InputTraceEnabled();
+    const BOOL read_ok = trace ? ImmGetCandidateWindow(context, 0, &actual) : FALSE;
     ImmReleaseContext(hwnd, context);
-    char message[256];
-    std::snprintf(message, sizeof(message),
-        "IMM position set composition=%d candidate=%d read=%d actual=%ld,%ld style=%lu",
-        composition_ok, candidate_ok, read_ok, actual.ptCurrentPos.x,
-        actual.ptCurrentPos.y, static_cast<unsigned long>(actual.dwStyle));
-    InputTrace(message);
+    if (trace) {
+      char message[256];
+      std::snprintf(message, sizeof(message),
+          "IMM position set composition=%d candidate=%d read=%d actual=%ld,%ld style=%lu",
+          composition_ok, candidate_ok, read_ok, actual.ptCurrentPos.x,
+          actual.ptCurrentPos.y, static_cast<unsigned long>(actual.dwStyle));
+      InputTrace(message);
+    }
   } else {
     InputTrace("IMM context unavailable");
   }
 }
 
 void InputTrace(const char* stage) {
-  static const bool enabled = [] {
-    wchar_t value[2]{};
-    return GetEnvironmentVariableW(L"H2READMD_INPUT_TRACE", value, 2) == 1 && value[0] == L'1';
-  }();
-  if (!enabled) return;
+  if (!InputTraceEnabled()) return;
   wchar_t folder[MAX_PATH]{};
   if (!GetTempPathW(MAX_PATH, folder)) return;
   const auto path = std::wstring(folder) + L"H2Readmd-input-" +

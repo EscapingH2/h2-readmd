@@ -56,6 +56,42 @@ void main() {
         matching: find.textContaining(text, findRichText: true),
       );
 
+  testWidgets('Windows caret updates work with input tracing on or off', (tester) async {
+    const channel = MethodChannel('h2readmd/desktop_input');
+    final calls = <MethodCall>[];
+    final messenger = tester.binding.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      return null;
+    });
+    addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+    await startApp(tester, const MarkdownApp(initialText: '甲乙'));
+    final editor = tester.widget<TextField>(find.byType(TextField));
+    editor.focusNode!.requestFocus();
+    await tester.pumpAndSettle();
+    calls.clear();
+    editor.controller!.value = const TextEditingValue(
+      text: '甲乙拼',
+      selection: TextSelection.collapsed(offset: 3),
+      composing: TextRange(start: 2, end: 3),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    final state = tester.state<EditableTextState>(find.byType(EditableText));
+    final render = state.renderEditable;
+    final rect = render.getLocalRectForCaret(const TextPosition(offset: 3));
+    final point = render.localToGlobal(rect.bottomLeft) * View.of(state.context).devicePixelRatio;
+    expect(calls.lastWhere((c) => c.method == 'caret').arguments, [point.dx, point.dy]);
+    final traces = calls.where((c) => c.method == 'trace').map((c) => c.arguments as String);
+    if (Platform.environment['H2READMD_INPUT_TRACE'] == '1') {
+      expect(traces, contains(startsWith('Dart geometry requested')));
+      expect(traces, contains(startsWith('Dart caret x=')));
+    } else {
+      expect(traces, isEmpty);
+    }
+  }, skip: !Platform.isWindows);
+
   test('Literal multiline replacements preserve CRLF, Unicode and replacement characters', () {
     final find = DocumentFind();
     const source = '甲.*\r\n😄甲.*\r\n尾';

@@ -219,6 +219,7 @@ class _EditorScrollBehavior extends MaterialScrollBehavior {
 class _EditorPageState extends State<EditorPage> with WindowListener {
   static const _files = Filegate();
   final _controller = FindEditingController();
+  late TextEditingValue _lastDocumentValue;
   final _query = TextEditingController();
   final _replacement = TextEditingController();
   final _queryFocus = FocusNode();
@@ -275,10 +276,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   void _refreshFind({int? anchor, bool reveal = true}) {
     if (!_panelOpen) return;
     if (_find.source != _controller.text) _previewMap = null;
-    setState(() {
-      _find.update(_controller.text, _query.text, _find.matchCase, anchor: anchor);
-      if (_find.hits.isNotEmpty) _previewMap ??= PreviewFindMap(_controller.text);
-    });
+    setState(() => _find.update(_controller.text, _query.text, _find.matchCase, anchor: anchor));
     if (reveal) {
       _revealFind();
     } else {
@@ -287,7 +285,8 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   }
 
   PreviewFindPainter _previewPainter() => PreviewFindPainter(_previewKey,
-      _previewScrollController, _find, _previewMap!, Theme.of(context).colorScheme);
+      _previewScrollController, _find, _previewMap ??= PreviewFindMap(_controller.text),
+      Theme.of(context).colorScheme);
 
   void _revealFind() {
     final generation = ++_revealGeneration;
@@ -306,7 +305,13 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
               .clamp(pos.minScrollExtent, pos.maxScrollExtent).toDouble());
         }
       }
-      final painter = _previewPainter();
+      final previewContext = _previewKey.currentContext;
+      if (previewContext == null ||
+          previewContext.findAncestorWidgetOfExactType<Offstage>()?.offstage == true) {
+        return;
+      }
+      final painter = (previewContext.widget as CustomPaint).foregroundPainter;
+      if (painter is! PreviewFindPainter) return;
       void preview(Duration _) {
         if (!mounted || generation != _revealGeneration || _view == ViewMode.editor) return;
         if (!painter.reveal()) {
@@ -319,8 +324,11 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     WidgetsBinding.instance.ensureVisualUpdate();
   }
 
-  void _setView(ViewMode mode) {
-    setState(() => _view = mode);
+  void _setView(ViewMode mode, {bool resetSplit = false}) {
+    setState(() {
+      _view = mode;
+      if (resetSplit) _editorFraction = .5;
+    });
     if (_panelOpen) _revealFind();
   }
 
@@ -417,6 +425,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   final _previewScrollController = ScrollController();
   double? _editorLayoutWidth;
   double? _previewLayoutWidth;
+  Widget? _lastDesktopPreview;
   String? _path;
   String? _diskVersion;
   bool _unconfirmedSave = false;
@@ -442,6 +451,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     if (_path != null) _name = File(_path!).uri.pathSegments.last;
     _savedText = widget.initialText;
     _controller.text = widget.initialText;
+    _lastDocumentValue = _controller.value;
     if (Platform.isWindows) _documentUndo = DocumentHistory(_controller);
     _controller.addListener(_changed);
     _editorFocus.addListener(_trackImeGeometry);
@@ -476,12 +486,22 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
   }
 
   void _changed() {
-    if (_panelOpen && _controller.text != _find.source) {
+    final previous = _lastDocumentValue;
+    final current = _controller.value;
+    _lastDocumentValue = current;
+    _trackImeGeometry();
+    // EditableText listens to selection changes itself. Keep the normal
+    // update path during composition and when the composing range changes.
+    if (current.text == previous.text &&
+        current.composing == previous.composing &&
+        current.composing.isCollapsed) {
+      return;
+    }
+    if (_panelOpen && current.text != _find.source) {
       _refreshFind(reveal: false);
     } else {
       setState(() {});
     }
-    _trackImeGeometry();
     _syncWindowTitle();
   }
 
@@ -866,14 +886,14 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     );
   }
 
-  Widget _preview() => Container(
+  Widget _preview({bool visible = true}) => Container(
         color: Theme.of(context).colorScheme.surface,
         child: _markdownTheme(SelectionArea(
           focusNode: _previewFocus,
           onSelectionChanged: (content) => _previewSelection = content?.plainText ?? '',
           child: CustomPaint(
             key: _previewKey,
-            foregroundPainter: _panelOpen && _find.hits.isNotEmpty ? _previewPainter() : null,
+            foregroundPainter: visible && _panelOpen && _find.hits.isNotEmpty ? _previewPainter() : null,
             child: CustomScrollView(
             controller: _previewScrollController,
             primary: false,
@@ -1005,7 +1025,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
       if (value == 'both') _setView(ViewMode.both);
       if (value == 'editor') _setView(ViewMode.editor);
       if (value == 'preview') _setView(ViewMode.preview);
-      if (value == 'reset') setState(() { _view = ViewMode.both; _editorFraction = .5; });
+      if (value == 'reset') _setView(ViewMode.both, resetSplit: true);
     },
     itemBuilder: (_) => [
       if (collapsed) const PopupMenuItem(value: 'new', child: Text('新建')),
@@ -1082,6 +1102,11 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
     final showPreview = _view != ViewMode.editor && (width > 10 || _view == ViewMode.preview);
     if (showEditor) _editorLayoutWidth = split ? leftWidth : width;
     if (showPreview) _previewLayoutWidth = split ? available - leftWidth : width;
+    // Keep the mounted viewport, but don't feed edits or new Markdown
+    // configurations into its sliver while it is offstage.
+    if (showPreview || _lastDesktopPreview == null) {
+      _lastDesktopPreview = _preview(visible: showPreview);
+    }
     // Stable sibling slots retain both subtrees and their ScrollPositions.
     // Hidden panes keep their last width so hiding does not reflow their text.
     return Stack(children: [
@@ -1092,7 +1117,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
       Positioned(right: 0, top: 0, bottom: 0,
         width: _previewLayoutWidth ?? width,
         child: Offstage(offstage: !showPreview,
-          child: ExcludeFocus(excluding: !showPreview, child: _preview()))),
+          child: ExcludeFocus(excluding: !showPreview, child: _lastDesktopPreview!))),
       Positioned(left: leftWidth, top: 0, bottom: 0, width: 10,
         child: Offstage(offstage: !split,
           child: MouseRegion(
@@ -1236,7 +1261,7 @@ class _EditorPageState extends State<EditorPage> with WindowListener {
               onSelected: (value) {
                 if (value == 'saveAs') _save(saveAs: true);
                 if (value == 'theme') widget.onThemeToggle();
-                if (value == 'reset') setState(() { _view = ViewMode.both; _editorFraction = .5; });
+                if (value == 'reset') _setView(ViewMode.both, resetSplit: true);
               },
               itemBuilder: (context) => const [
                 PopupMenuItem(value: 'saveAs', child: Text('另存为')),

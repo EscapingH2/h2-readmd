@@ -226,12 +226,12 @@ void main() {
     expect(doc.text, '新分支');
   });
 
-  for (final previewOnly in [false, true]) {
-    testWidgets('Rapid replacements have separate undo and redo steps (preview=$previewOnly)', (tester) async {
+  for (final mode in ['分栏', '预览', '编辑']) {
+    testWidgets('Rapid replacements have separate undo and redo steps ($mode)', (tester) async {
       await startApp(tester, const MarkdownApp(initialText: 'old old old'));
       final doc = tester.widget<TextField>(find.byType(TextField)).controller!;
-      if (previewOnly) {
-        await tester.tap(find.text('预览'));
+      if (mode != '分栏') {
+        await tester.tap(find.text(mode));
         await tester.pump();
       }
       Future<void> ctrl(LogicalKeyboardKey key) async {
@@ -553,6 +553,108 @@ void main() {
       await tester.pumpWidget(const SizedBox.shrink());
     }, skip: !Platform.isWindows);
   }
+
+  testWidgets('Selection updates keep the preview and report IME caret geometry', (tester) async {
+    const input = MethodChannel('h2readmd/desktop_input');
+    final calls = <MethodCall>[];
+    final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(input, (call) async { calls.add(call); return null; });
+    addTearDown(() => messenger.setMockMethodCallHandler(input, null));
+    await startApp(tester, const MarkdownApp(initialText: '中文输入'));
+    final field = find.byType(TextField);
+    await tester.showKeyboard(field);
+    await tester.pumpAndSettle();
+    final sliver = find.byType(SliverGptMarkdown);
+    final before = tester.widget(sliver);
+    final controller = tester.widget<TextField>(field).controller!;
+    calls.clear();
+    tester.testTextInput.updateEditingValue(const TextEditingValue(
+      text: '中文输入', selection: TextSelection(baseOffset: 1, extentOffset: 3)));
+    await tester.pump();
+    expect(controller.selection, const TextSelection(baseOffset: 1, extentOffset: 3));
+    expect(tester.widget(sliver), same(before));
+    void expectCaret(int offset) {
+      final render = tester.state<EditableTextState>(find.byType(EditableText)).renderEditable;
+      final local = render.getLocalRectForCaret(TextPosition(offset: offset)).bottomLeft;
+      final expected = render.localToGlobal(local) * tester.view.devicePixelRatio;
+      expect(calls.lastWhere((call) => call.method == 'caret').arguments, [expected.dx, expected.dy]);
+    }
+    expectCaret(3);
+    const composing = TextEditingValue(text: '中文拼音',
+        selection: TextSelection.collapsed(offset: 4), composing: TextRange(start: 2, end: 4));
+    tester.testTextInput.updateEditingValue(composing);
+    await tester.pump();
+    expect(controller.value, composing);
+    expectCaret(4);
+    calls.clear();
+    final moved = composing.copyWith(selection: const TextSelection.collapsed(offset: 2));
+    tester.testTextInput.updateEditingValue(moved);
+    await tester.pump();
+    expect(controller.value, moved);
+    expectCaret(2);
+    tester.testTextInput.updateEditingValue(moved.copyWith(composing: TextRange.empty));
+    await tester.pump();
+    expect(controller.value.composing, TextRange.empty);
+    expect(tester.widget<SliverGptMarkdown>(sliver).data, composing.text);
+    await tester.pumpWidget(const SizedBox.shrink());
+  }, skip: !Platform.isWindows);
+
+  testWidgets('Hidden preview retains its text and viewport until shown', (tester) async {
+    final text = List.generate(120, (i) => '第 $i 段').join('\n\n');
+    await startApp(tester, MarkdownApp(initialText: text));
+    final sliver = find.byType(SliverGptMarkdown, skipOffstage: false);
+    final preview = tester.widget<CustomScrollView>(find.byType(CustomScrollView)).controller!;
+    final position = preview.position;
+    preview.jumpTo(400);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('编辑'));
+    await tester.pumpAndSettle();
+    final hidden = tester.widget(sliver);
+    final controller = tester.widget<TextField>(find.byType(TextField)).controller!;
+    for (final tail in ['中', '中文', '中']) {
+      controller.text = text + tail;
+      await tester.pump();
+      expect(tester.widget(sliver), same(hidden));
+      expect(tester.widget<SliverGptMarkdown>(sliver).data, text);
+    }
+    await tester.tap(find.text('预览'));
+    await tester.pump();
+    expect(tester.widget<SliverGptMarkdown>(sliver).data, controller.text);
+    await tester.pumpAndSettle();
+    expect(preview.position, same(position));
+    expect(preview.offset, closeTo(400, 1));
+    await tester.pumpWidget(const SizedBox.shrink());
+  }, skip: !Platform.isWindows);
+
+  testWidgets('Hidden preview search tracks source edits and reveals the latest hit', (tester) async {
+    await startApp(tester, const MarkdownApp(initialText: '目标'));
+    final doc = tester.widget<TextField>(find.byType(TextField)).controller!;
+    await tester.tap(find.text('编辑'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('更多'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('查找  Ctrl+F'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.widgetWithText(TextField, '查找内容'), '目标');
+    await tester.pumpAndSettle();
+    doc.text = ['目标', for (var i = 0; i < 110; i++) '段落 $i', '**末尾目标**'].join('\n\n');
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('下一个'));
+    await tester.pumpAndSettle();
+    expect(find.text('2/2'), findsOneWidget);
+    Iterable<PreviewFindPainter> painters() => tester.widgetList<CustomPaint>(
+        find.byType(CustomPaint, skipOffstage: false)).map((w) => w.foregroundPainter)
+        .whereType<PreviewFindPainter>();
+    expect(painters(), isEmpty);
+    await tester.tap(find.text('分栏'));
+    await tester.pumpAndSettle();
+    expect(find.text('2/2'), findsOneWidget);
+    final painter = painters().single;
+    expect(painter.currentGlyphBox(), isNotNull);
+    expect(painter.scroll.offset, greaterThan(1000));
+    expect(previewText('末尾目标').hitTestable(), findsWidgets);
+    await tester.pumpWidget(const SizedBox.shrink());
+  }, skip: !Platform.isWindows);
 
   testWidgets('View switches retain both viewport states and independent offsets',
       (tester) async {

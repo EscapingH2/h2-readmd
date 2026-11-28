@@ -1,6 +1,6 @@
 ; Inno Setup 6. All source/output paths are relative to this script.
 #define AppName "H2 Readmd"
-#define AppVersion "1.0.5"
+#define AppVersion "1.1.0"
 #define AppExeName "H2Readmd.exe"
 #define ReleaseDir "..\build\windows\x64\runner\Release"
 
@@ -35,6 +35,7 @@
 AppId={{C38DF467-0783-4B25-B4BF-6E9B1EA242D0}
 AppName={#AppName}
 AppVersion={#AppVersion}
+VersionInfoVersion={#AppVersion}.0
 AppVerName={#AppName} {#AppVersion}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
